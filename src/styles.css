@@ -1,0 +1,158 @@
+:root {
+  --panel-bg: rgba(0, 0, 0, 0.66);
+  --panel-fg: #d8dde6;
+  --muted: #9aa3b2;
+  --error: #ff8a80;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: #1b1e24;
+  color: var(--panel-fg);
+  font: 13px/1.4 system-ui, sans-serif;
+  overflow: hidden;
+}
+
+.app,
+.viewer {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.viewer canvas {
+  display: block;
+}
+
+.panel {
+  position: fixed;
+  left: 12px;
+  top: 12px;
+  max-width: 360px;
+  max-height: calc(100% - 24px);
+  overflow: auto;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--panel-bg);
+}
+
+.panel h1 {
+  margin: 0 0 6px;
+  font-size: 14px;
+  color: #fff;
+}
+
+.panel .row {
+  display: block;
+  margin-top: 6px;
+  cursor: pointer;
+}
+
+.panel fieldset {
+  margin: 8px 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.info {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 8px;
+  margin: 8px 0 0;
+}
+
+.info dt {
+  color: var(--muted);
+}
+
+.info dd {
+  margin: 0;
+}
+
+.muted,
+.hint {
+  color: var(--muted);
+}
+
+.hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+}
+
+.status {
+  margin: 8px 0 0;
+}
+
+.status.error {
+  color: var(--error);
+}
+
+.drop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.66);
+  font-size: 20px;
+  pointer-events: none;
+}
+
+.panel .actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.panel .actions button {
+  font: inherit;
+  padding: 3px 8px;
+  color: var(--panel-fg);
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.panel .actions button:hover { background: rgba(255, 255, 255, 0.22); }
+.panel .selection legend { padding: 0 4px; }
+
+/* Overlay: danh sách file đang mở */
+.panel .overlay legend { padding: 0 4px; }
+.panel .layers { list-style: none; margin: 4px 0 8px; padding: 0; }
+.panel .layers li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  border-radius: 4px;
+}
+.panel .layers li.active { background: rgba(255, 152, 0, 0.25); outline: 1px solid rgba(255, 152, 0, 0.7); }
+.panel .layers .name {
+  font: inherit;
+  color: var(--panel-fg);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+  text-decoration: underline dotted;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 14em;
+}
+.panel .layers .name:disabled { cursor: default; text-decoration: none; opacity: 0.7; }
+.panel .layers .remove {
+  margin-left: auto;
+  font: inherit;
+  color: var(--panel-fg);
+  background: none;
+  border: none;
+  cursor: pointer;
+  opacity: 0.7;
+}
+.panel .layers .remove:hover { opacity: 1; }
+.panel .layers .error { color: #ff8a80; }

@@ -1,0 +1,652 @@
+<!doctype html>
+<html lang="vi">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>VSFX Viewer (Three.js, parser thủ công)</title>
+  <style>
+    html,
+    body {
+      margin: 0;
+      height: 100%;
+      background: #1b1e24;
+      color: #d8dde6;
+      font: 13px/1.4 system-ui, sans-serif;
+      overflow: hidden
+    }
+
+    #hud {
+      position: fixed;
+      left: 12px;
+      top: 12px;
+      background: #000a;
+      padding: 10px 12px;
+      border-radius: 8px;
+      max-width: 340px
+    }
+
+    #hud b {
+      color: #fff
+    }
+
+    #hud label {
+      display: block;
+      margin-top: 6px;
+      cursor: pointer
+    }
+
+    #drop {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: #000a;
+      font-size: 20px
+    }
+  </style>
+</head>
+
+<body>
+  <div id="hud"><b>VSFX viewer</b>
+    <div id="info">Đang tải…</div>
+    <label><input type="checkbox" id="edges" checked> Hiện cạnh</label>
+    <label><input type="checkbox" id="light" checked> Nền sáng</label>
+    <label><input type="checkbox" id="glass" checked> Kính trong suốt</label>
+    <label><input type="checkbox" id="color"> Màu theo entity (debug)</label>
+    <label>Mở file khác: <input type="file" id="file" accept=".vsfx"></label>
+  </div>
+  <div id="drop">Thả file .vsfx vào đây</div>
+
+  <script type="importmap">
+{"imports":{
+  "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    /* ================= Parser VSFX (tự viết, không dùng loader) =================
+     * Định dạng ODA Visualize (.vsfx). KHÔNG có spec công khai; mọi quy tắc dưới đây
+     * được suy ra bằng reverse-engineering trên file mẫu, mọi số đều little-endian.
+     *
+     * 1. Container: 'VSFX' + header tới 0x75, sau đó các block [u32 len][zlib] (mỗi block 64 KB
+     *    khi giải nén). Nối lại thành một luồng nhị phân.
+     * 2. Shell (lưới):  08 00 00 00 00 0C 00 ?? 00 00 | u32 cnt | cnt × (x,y,z float64)
+     *    rồi face list:  u32 0xFFFFFFFF, u32 N, N × i32  -> (n, i0..in-1)... ; n âm = lỗ của face trước
+     *               hoặc u32 n (cố định, vd 4), u32 T  -> T/(n+1) face, mỗi face n index (không có count)
+     * 3. Node:  marker 40 10 11 00 00 01 01 00 00 00 72; owner (u64) ở offset +44.
+     *    Owner phổ biến nhất = model space; owner khác = thân block của entity model-space
+     *    liền trước, dùng chung ma trận với entity đó.
+     * 4. Entity: header  [B G R] C2 FF FF | u16 len | tên UTF-16 (vd OdIfc2x3::IfcWallStandardCase).
+     *    Màu là OdCmEntityColor (0xC2 = by RGB). Shell nằm sau header thuộc entity đó.
+     * 5. Transform của entity thường: 3 double tịnh tiến + 9 double ma trận xoay (orthonormal),
+     *    nằm ở CUỐI phạm vi entity (ngay trước node kế tiếp). world = Mᵀ·v + t.
+     * 6. Entity INSERT (OdIfcRepresentationMap): ngay trước header là
+     *    18 00 1D 00 00 00 00 00 01 + 12 byte 0 | pos(3) scale(3) angle normal(3) (float64) | u64 handle
+     *    Hình học của handle chỉ lưu ở lần xuất hiện đầu, các INSERT sau dùng lại.
+     *    world = OCS(normal) · (pos + Rz(angle) · S · v)   (Arbitrary Axis Algorithm của AutoCAD)
+     */
+    async function inflate(u8) {
+      const ds = new DecompressionStream('deflate');
+      const s = new Blob([u8]).stream().pipeThrough(ds);
+      return new Uint8Array(await new Response(s).arrayBuffer());
+    }
+    async function readStream(buf) {
+      const u8 = new Uint8Array(buf), dv = new DataView(buf);
+      if (String.fromCharCode(...u8.subarray(0, 4)) !== 'VSFX') throw new Error('Không phải file VSFX');
+      const parts = []; let pos = 0x75, total = 0;
+      while (pos + 4 <= u8.length) {
+        const cl = dv.getUint32(pos, true);
+        const out = await inflate(u8.subarray(pos + 4, pos + 4 + cl));
+        parts.push(out); total += out.length; pos += 4 + cl;
+      }
+      const raw = new Uint8Array(total); let o = 0;
+      for (const p of parts) { raw.set(p, o); o += p.length; }
+      return raw;
+    }
+
+    /* Đơn vị: bản ghi [u32 số ký tự] tên (UTF-16) 02 00 00 00 viết-tắt, vd "Millimeters"/"mm", "Feet"/"ft".
+     * Trả về số mm của 1 đơn vị file, hoặc null nếu không tìm thấy. */
+    function detectUnitMM(raw) {
+      const units = { Millimeters: 1, Centimeters: 10, Meters: 1000, Feet: 304.8, Inches: 25.4 };
+      for (const [name, mm] of Object.entries(units)) {
+        const n = name.length;
+        outer: for (let q = 4; q + n * 2 + 4 <= raw.length; q++) {
+          if (raw[q] !== name.charCodeAt(0) || raw[q + 1]) continue;
+          for (let k = 1; k < n; k++) if (raw[q + k * 2] !== name.charCodeAt(k) || raw[q + k * 2 + 1]) continue outer;
+          const e = q + n * 2;
+          if (raw[q - 4] === n && !raw[q - 3] && !raw[q - 2] && !raw[q - 1] && raw[e] === 2 && !raw[e + 1] && !raw[e + 2] && !raw[e + 3]) return mm;
+        }
+      }
+      return null;
+    }
+
+    function parseScene(raw) {
+      const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength), L = raw.length;
+      const f64 = o => dv.getFloat64(o, true), u32 = o => dv.getUint32(o, true), i32 = o => dv.getInt32(o, true);
+
+      // --- 2. shells
+      const shells = [];
+      for (let o = 0; o + 22 <= L; o++) {
+        // header shell: 08 00 00 00 00 0C 00 [cờ] [cờ2] 00 — cờ2 = 01 khi shell có thêm dữ liệu theo đỉnh
+        // (normal/UV; vd tấm kính trong file Revit), = 00 với shell thường.
+        if (raw[o] !== 8 || raw[o + 1] || raw[o + 2] || raw[o + 3] || raw[o + 4] || raw[o + 5] !== 0x0c ||
+            raw[o + 6] || raw[o + 8] > 1 || raw[o + 9]) continue;
+        const cnt = u32(o + 10), s = o + 14;
+        if (cnt < 1 || cnt > 500000 || s + cnt * 24 + 8 > L) continue;
+        const v = new Float64Array(cnt * 3); let ok = true;
+        for (let i = 0; i < cnt * 3; i++) {
+          const x = f64(s + i * 8);
+          if (!Number.isFinite(x) || Math.abs(x) > 1e7) { ok = false; break; }
+          v[i] = x;
+        }
+        if (!ok) continue;
+        const e = s + cnt * 24, a = u32(e), T = u32(e + 4);
+        let faces = null, end = 0;
+        if (a === 0xFFFFFFFF) {
+          if (T < 4 || e + 8 + T * 4 > L) continue;
+          faces = new Int32Array(T);
+          let p = 0;
+          for (let i = 0; i < T; i++) faces[i] = i32(e + 8 + i * 4);
+          while (p < T) {
+            const n = Math.abs(faces[p]);
+            if (n < 3 || p + 1 + n > T) { ok = false; break; }
+            for (let k = 1; k <= n; k++) if (faces[p + k] < 0 || faces[p + k] >= cnt) ok = false;
+            p += 1 + n;
+          }
+          if (!ok || p !== T) continue;
+          end = e + 8 + T * 4;
+        } else if (a >= 3 && a <= 64 && T > 0 && T % (a + 1) === 0) {
+          const nf = T / (a + 1);
+          if (e + 8 + nf * a * 4 > L) continue;
+          faces = new Int32Array(T);
+          let q = 0;
+          for (let f = 0; f < nf && ok; f++) {
+            faces[q++] = a;
+            for (let k = 0; k < a; k++) {
+              const idx = u32(e + 8 + (f * a + k) * 4);
+              if (idx >= cnt) { ok = false; break; }
+              faces[q++] = idx;
+            }
+          }
+          if (!ok) continue;
+          end = e + 8 + nf * a * 4;
+        } else continue;
+        // Màu theo từng mặt (file Revit, vd mặt đất): 01 00 00 03 00 01 00 01 00 01 [u32 n] + n × (01 B G R C2)
+        let faceColors = null;
+        if (end + 14 <= L && raw[end] === 1 && raw[end + 3] === 3 && raw[end + 5] === 1 && raw[end + 7] === 1 && raw[end + 9] === 1) {
+          const n = u32(end + 10), q = end + 14;
+          if (n > 0 && n < 1e6 && q + n * 5 <= L) {
+            faceColors = new Int32Array(n); let ok2 = true;
+            for (let k = 0; k < n; k++) {
+              const b = q + k * 5;
+              if (raw[b] !== 1 || raw[b + 4] !== 0xc2) { ok2 = false; break; }
+              faceColors[k] = (raw[b + 3] << 16) | (raw[b + 2] << 8) | raw[b + 1];
+            }
+            if (!ok2) faceColors = null;
+          }
+        }
+        shells.push({ off: s, end, verts: v, faces, faceColors });
+        o = end - 1;
+      }
+
+      // --- 3. nodes
+      const MK = [0x40, 0x10, 0x11, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x72];
+      const nodes = [];
+      outer: for (let o = 0; o + 60 <= L; o++) {
+        for (let k = 0; k < MK.length; k++) if (raw[o + k] !== MK[k]) continue outer;
+        nodes.push({ off: o, owner: u32(o + 44) });
+      }
+      const ownerCount = new Map();
+      for (const n of nodes) ownerCount.set(n.owner, (ownerCount.get(n.owner) || 0) + 1);
+      const modelOwner = [...ownerCount.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+      // File xuất từ Revit (ODA Visualize OdTv*) không có node kiểu IFC -> nhánh riêng.
+      if (!nodes.length) return parseTv(raw, shells);
+
+      // --- 5. transform orthonormal
+      const xfs = [];
+      const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+      for (let o = nodes.length ? nodes[0].off - 2000 : 0; o + 96 <= L; o++) {
+        if (o < 0) continue;
+        const m = []; let ok = true;
+        for (let i = 0; i < 9; i++) {
+          const x = f64(o + 24 + i * 8);
+          if (!(Math.abs(x) <= 1.0000001)) { ok = false; break; }
+          m.push(x);
+        }
+        if (!ok) continue;
+        const r = [m.slice(0, 3), m.slice(3, 6), m.slice(6, 9)];
+        for (let i = 0; i < 3 && ok; i++) {
+          if (Math.abs(dot(r[i], r[i]) - 1) > 1e-6) ok = false;
+          for (let j = i + 1; j < 3 && ok; j++) if (Math.abs(dot(r[i], r[j])) > 1e-6) ok = false;
+        }
+        if (!ok) continue;
+        const t = [f64(o), f64(o + 8), f64(o + 16)];
+        if (!t.every(x => Number.isFinite(x) && Math.abs(x) < 1e7)) continue;
+        const M = new THREE.Matrix4().set(
+          m[0], m[3], m[6], t[0],
+          m[1], m[4], m[7], t[1],
+          m[2], m[5], m[8], t[2],
+          0, 0, 0, 1);
+        xfs.push({ off: o, M }); o += 95;
+      }
+
+      // --- 4/6. entity headers
+      const ents = [];
+      for (let p = 3; p + 5 <= L; p++) {
+        // byte màu: C0 = ByLayer, C1 = ByBlock, C2 = RGB, C3 = ACI, … (IFC4 còn có C7).
+        // Sau đó là FF FF hoặc 00 00 (mp.vsfx), rồi u16 độ dài tên.
+        if (raw[p] < 0xc0 || raw[p] > 0xc8) continue;
+        const ffff = raw[p + 1] === 0xff && raw[p + 2] === 0xff, zero = !raw[p + 1] && !raw[p + 2];
+        if (!ffff && !zero) continue;
+        const len = raw[p + 3] | (raw[p + 4] << 8);
+        if (len > 80 || p + 5 + len * 2 > L || (zero && len < 3)) continue;
+        let name = '', ok = true;
+        for (let i = 0; i < len; i++) {
+          const lo = raw[p + 5 + i * 2], hi = raw[p + 6 + i * 2];
+          if (hi || lo < 0x20 || lo > 0x7e) { ok = false; break; }
+          name += String.fromCharCode(lo);
+        }
+        if (!ok) continue;
+        const color = raw[p] === 0xc2 ? (raw[p - 1] << 16) | (raw[p - 2] << 8) | raw[p - 3] : 0;
+        const ent = { p, name, color };
+        const q = p - 115;
+        if (q >= 0 && raw[q] === 0x18 && raw[q + 1] === 0 && raw[q + 2] === 0x1d && raw[q + 8] === 1 &&
+            raw[q + 110] === 0x0d && (raw[q + 111] === 0x06 || raw[q + 111] === 0x04)) {   // 0D 06 (IFC2x3) / 0D 04 (IFC4)
+          const d = i => f64(q + 21 + i * 8);
+          ent.insert = { P: [d(0), d(1), d(2)], S: [d(3), d(4), d(5)], ang: d(6), N: [d(7), d(8), d(9)], h: u32(q + 101) };
+        }
+        ents.push(ent);
+        p += 4 + len * 2;
+      }
+
+      // --- gán shell + transform cho entity
+      const insertMatrix = ({ P, S, ang, N }) => {
+        const n = new THREE.Vector3(...N).normalize();
+        const ax = (Math.abs(n.x) < 1 / 64 && Math.abs(n.y) < 1 / 64)
+          ? new THREE.Vector3(0, 1, 0).cross(n) : new THREE.Vector3(0, 0, 1).cross(n);
+        ax.normalize();
+        const ay = new THREE.Vector3().crossVectors(n, ax).normalize();
+        const ocs = new THREE.Matrix4().makeBasis(ax, ay, n);
+        return ocs.multiply(new THREE.Matrix4().makeTranslation(P[0], P[1], P[2]))
+          .multiply(new THREE.Matrix4().makeRotationZ(ang))
+          .multiply(new THREE.Matrix4().makeScale(S[0], S[1], S[2]));
+      };
+      const nodeAt = p => { let lo = 0, hi = nodes.length - 1, r = -1; while (lo <= hi) { const m = (lo + hi) >> 1; if (nodes[m].off <= p) { r = m; lo = m + 1; } else hi = m - 1; } return r; };
+
+      // Mỗi header -> một "phần" (part) gồm các shell đứng sau nó (tới header/node kế tiếp).
+      // Header con ('' hoặc IfcShapeRepresentation) gắn vào entity cấp trên trong cùng node.
+      const isSub = n => n === '' || n.endsWith('::IfcShapeRepresentation');   // IFC2x3 lẫn IFC4
+      const top = [];
+      let si = 0;
+      for (let i = 0; i < ents.length; i++) {
+        const e = ents[i], ni = nodeAt(e.p);
+        let bound = i + 1 < ents.length ? ents[i + 1].p - 120 : L;
+        if (ni + 1 < nodes.length) bound = Math.min(bound, nodes[ni + 1].off);
+        while (si < shells.length && shells[si].off < e.p) si++;
+        const part = { color: e.color, shells: [] };
+        for (let k = si; k < shells.length && shells[k].off < bound; k++) part.shells.push(shells[k]);
+        const parent = top[top.length - 1];
+        if (!e.insert && isSub(e.name) && parent && parent.ni === ni) {
+          parent.parts.push(part); parent.end = bound;
+        } else {
+          top.push({ ...e, ni, parts: [part], end: bound });
+        }
+      }
+
+      const defs = new Map(), instances = [];
+      let xi = 0, skipped = 0, lastM = null;
+      for (const e of top) {
+        const parts = e.parts.filter(pt => pt.shells.length);
+        if (e.insert) {
+          const h = e.insert.h;
+          if (parts.length && !defs.has(h)) defs.set(h, parts);
+          const geo = parts.length ? parts : (defs.get(h) || []);
+          if (geo.length) instances.push({ parts: geo, M: insertMatrix(e.insert), name: e.name, insert: e.insert, own: parts.length > 0 });
+        } else {
+          if (!parts.length) continue;
+          const owner = e.ni >= 0 ? nodes[e.ni].owner : modelOwner;
+          if (owner !== modelOwner && e.name === '') {
+            // Entity không tên trong node thuộc block (owner ≠ model space): là phần thân của
+            // entity model-space liền trước, dùng chung ma trận (kiểm chứng bằng bảng extents).
+            if (!lastM) { skipped += parts.reduce((a, pt) => a + pt.shells.length, 0); continue; }
+            instances.push({ parts, M: lastM, name: e.name || '(block)' });
+            continue;
+          }
+          let M = null;
+          while (xi < xfs.length && xfs[xi].off < e.p) xi++;
+          for (let k = xi; k < xfs.length && xfs[k].off < e.end; k++) M = xfs[k].M;
+          lastM = M || new THREE.Matrix4();
+          instances.push({ parts, M: lastM, name: e.name });
+        }
+      }
+      return { shells, instances, nodes: nodes.length, xfs: xfs.length, defs: defs.size, skipped, unitMM: detectUnitMM(raw) ?? 1, format: 'IFC' };
+    }
+
+    /* ================= Nhánh OdTv (file xuất từ Revit) =================
+     * Suy ra từ file mẫu revit.vsfx, kiểm chứng bằng bảng extents (handle + bbox) trong file:
+     *  - Bản ghi bắt đầu bằng 50 00 11. Handle riêng:
+     *      A: 50 00 11 00 00 …(10×00) 0C 02 00 00 00 [u32 h]       C: 50 00 11 01 01 … 0C 02 00 00 00 [h]
+     *      B (chứa hình học): sau 4 điểm (0B + 3 double) và 3 byte 0 là [u64 h]
+     *  - Danh sách con: [C0..C3] FF FF 00 00 [u32 n] rồi n × (12 00 00 00 00 08 00 00 00 00 [u64 h]),
+     *    sau đó 00 00 hoặc 01 01 + ma trận (3 double tịnh tiến + 9 double xoay) của bản ghi.
+     *  - Handle cấp tuần tự theo DFS => cây con của H chiếm khoảng [H, anh-em-kế-tiếp).
+     *    Bản ghi có handle = model space (handle phổ biến nhất) đánh dấu về cấp cao nhất.
+     *  - Hình học g nhận tích các ma trận của mọi H (cùng phạm vi cấp cao) có H ≤ g < end(H).
+     *  - Màu: 0D 04 00 00 [f1 f2] 00 [B G R] C2 (f1 & 0x40 = kế thừa) và FF FF FF FF [B G R] C2 FF.
+     *  - Đơn vị: feet (đơn vị nội bộ Revit). */
+    function parseTv(raw, shells) {
+      const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength), L = raw.length;
+      const f64 = o => dv.getFloat64(o, true), u32 = o => dv.getUint32(o, true);
+      const isPfx = q => raw[q] === 0x0c && raw[q + 1] === 0x02 && !raw[q + 2] && !raw[q + 3] && !raw[q + 4];
+
+      // --- bản ghi
+      const recs = [];
+      for (let o = 0; o + 40 <= L; o++)
+        if (raw[o] === 0x50 && raw[o + 1] === 0x00 && raw[o + 2] === 0x11) recs.push({ o });
+      for (let i = 0; i < recs.length; i++) {
+        const r = recs[i], o = r.o, end = i + 1 < recs.length ? recs[i + 1].o : L;
+        r.end = end; r.h = null; r.kids = []; r.xf = null;
+        if (raw[o + 15] === 0x0c && raw[o + 16] === 0x02 && (raw[o + 17] || raw[o + 18])) {   // B
+          for (let q = o + 20; q < Math.min(o + 240, end - 110); q++)
+            if (raw[q] === 0x0b && raw[q + 25] === 0x0b && raw[q + 50] === 0x0b && raw[q + 75] === 0x0b &&
+                !raw[q + 100] && !raw[q + 101] && !raw[q + 102]) { r.h = u32(q + 103); break; }
+        } else {
+          for (let q = o; q < Math.min(o + 800, end - 9); q++) if (isPfx(q)) { r.h = u32(q + 5); break; }
+        }
+        // danh sách con
+        const lim = Math.min(end, o + 4000);
+        for (let q = o; q + 26 <= lim; q++) {
+          if (raw[q] < 0xc0 || raw[q] > 0xc3 || raw[q + 1] !== 0xff || raw[q + 2] !== 0xff || raw[q + 3] || raw[q + 4]) continue;
+          const n = u32(q + 5); let p = q + 9;
+          if (n < 1 || n > 100000 || raw[p] !== 0x12 || raw[p + 5] !== 0x08) continue;
+          for (let k = 0; k < n && p + 18 <= end; k++, p += 18) {
+            if (raw[p] !== 0x12 || raw[p + 5] !== 0x08) break;
+            r.kids.push(u32(p + 10));
+          }
+          break;
+        }
+      }
+      const cnt = new Map();
+      for (const r of recs) if (r.h != null) cnt.set(r.h, (cnt.get(r.h) || 0) + 1);
+      const MO = [...cnt.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+
+      // --- cây handle: cha + anh em kế tiếp -> end(H)
+      const parent = new Map(), next = new Map();
+      for (const r of recs) r.kids.forEach((k, i) => { parent.set(k, r.h); next.set(k, i + 1 < r.kids.length ? r.kids[i + 1] : null); });
+      const endMemo = new Map();
+      const endOf = h => {
+        const chain = []; let x = h, res = Infinity;
+        for (let d = 0; d < 500; d++) {
+          if (endMemo.has(x)) { res = endMemo.get(x); break; }
+          chain.push(x);
+          const s = next.get(x);
+          if (s != null) { res = s; break; }
+          const p = parent.get(x);
+          if (p == null || p === x) break;
+          x = p;
+        }
+        for (const c of chain) endMemo.set(c, res);
+        return res;
+      };
+
+      // --- ma trận (orthonormal) + bản ghi chứa nó
+      const recAt = o => { let lo = 0, hi = recs.length - 1, r = -1; while (lo <= hi) { const m = (lo + hi) >> 1; if (recs[m].o <= o) { r = m; lo = m + 1; } else hi = m - 1; } return r; };
+      const tops = recs.filter(r => r.h === MO).map(r => r.o);
+      const scopeOf = o => { let lo = 0, hi = tops.length - 1, r = -1; while (lo <= hi) { const m = (lo + hi) >> 1; if (tops[m] <= o) { r = m; lo = m + 1; } else hi = m - 1; } return r; };
+      const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+      const holders = new Map();   // scope -> [{H,E,M}]
+      let nxf = 0;
+      for (let o = 0; o + 96 <= L; o++) {
+        const m = []; let ok = true;
+        for (let i = 0; i < 9; i++) { const x = f64(o + 24 + i * 8); if (!(Math.abs(x) <= 1.0000001)) { ok = false; break; } m.push(x); }
+        if (!ok) continue;
+        const rr = [m.slice(0, 3), m.slice(3, 6), m.slice(6, 9)];
+        for (let i = 0; i < 3 && ok; i++) {
+          if (Math.abs(dot(rr[i], rr[i]) - 1) > 1e-6) ok = false;
+          for (let j = i + 1; j < 3 && ok; j++) if (Math.abs(dot(rr[i], rr[j])) > 1e-6) ok = false;
+        }
+        const t = [f64(o), f64(o + 8), f64(o + 16)];
+        if (!ok || !t.every(x => Number.isFinite(x) && Math.abs(x) < 1e7)) continue;
+        const ri = recAt(o), H = ri >= 0 ? recs[ri].h : null, sc = scopeOf(o);
+        o += 95; nxf++;
+        if (H == null) continue;
+        const M = new THREE.Matrix4().set(m[0], m[3], m[6], t[0], m[1], m[4], m[7], t[1], m[2], m[5], m[8], t[2], 0, 0, 0, 1);
+        if (!holders.has(sc)) holders.set(sc, []);
+        holders.get(sc).push({ H, E: endOf(H), M });
+      }
+
+      // --- vật liệu: từ điển "GeneratedMaterial__N" + u64 handle; bản ghi vật liệu: tên, 00 00,
+      //     01 [double] [B G R] C2 (ambient), 01 [double] [B G R] C2 (diffuse)
+      const matDiffuse = new Map(), nameHandle = new Map(), nameDiffuse = new Map();
+      const GM = 'GeneratedMaterial__';
+      for (let q = 0; q + 60 < L; q++) {
+        if (raw[q] !== 0x47 || raw[q + 1] !== 0) continue;
+        let k = 0; for (; k < GM.length; k++) if (raw[q + k * 2] !== GM.charCodeAt(k) || raw[q + k * 2 + 1]) break;
+        if (k < GM.length) continue;
+        let e = q + GM.length * 2, num = '';
+        while (raw[e] >= 0x30 && raw[e] <= 0x39 && !raw[e + 1]) { num += String.fromCharCode(raw[e]); e += 2; }
+        if (!num) continue;
+        if (raw[e] === 0 && raw[e + 1] === 0 && raw[e + 2] === 1 && raw[e + 14] === 0xc2 && raw[e + 15] === 1 && raw[e + 27] === 0xc2)
+          nameDiffuse.set(num, (raw[e + 26] << 16) | (raw[e + 25] << 8) | raw[e + 24]);
+        else if (!nameHandle.has(num)) nameHandle.set(num, u32(e));
+        q = e - 1;
+      }
+      for (const [n, h] of nameHandle) if (nameDiffuse.has(n)) matDiffuse.set(h, nameDiffuse.get(n));
+
+      // --- sự kiện màu theo thứ tự luồng. 000000 = "không đặt màu" -> bỏ qua.
+      //     (Handle vật liệu của header nằm 8 byte trước 18 00 1D.)
+      const colors = [];
+      for (let q = 17; q + 12 <= L; q++) {
+        if (raw[q] === 0x0d && raw[q + 1] === 0x04 && !raw[q + 2] && !raw[q + 3] && !raw[q + 6] && raw[q + 10] === 0xc2) {
+          let c = (raw[q + 9] << 16) | (raw[q + 8] << 8) | raw[q + 7];
+          // Header kế thừa / màu 0: không đổi màu hiện tại. (Thử dùng màu diffuse của vật liệu làm
+          // dự phòng thì cây bị tô be, khác ảnh tham chiếu -> chỉ giữ lại bảng matDiffuse để tra cứu.)
+          if (!(raw[q + 4] & 0x40) && c !== 0) colors.push({ o: q, c });
+        } else if (raw[q] === 0xff && raw[q + 1] === 0xff && raw[q + 2] === 0xff && raw[q + 3] === 0xff && raw[q + 7] === 0xc2 && raw[q + 8] === 0xff) {
+          const c = (raw[q + 6] << 16) | (raw[q + 5] << 8) | raw[q + 4];
+          if (c) colors.push({ o: q, c });
+        }
+      }
+
+      // --- gán ma trận + màu cho từng shell, gom các shell liền nhau giống nhau thành instance
+      const instances = [], ident = new THREE.Matrix4();
+      const mCache = new Map();
+      let ci = -1, curColor = 0, lastScope = -2;
+      for (const sh of shells) {
+        const sc = scopeOf(sh.off);
+        while (ci + 1 < colors.length && colors[ci + 1].o < sh.off) {
+          ci++;
+          if (scopeOf(colors[ci].o) === sc) curColor = colors[ci].c;
+        }
+        if (sc !== lastScope) { lastScope = sc; if (ci < 0 || scopeOf(colors[ci].o) !== sc) curColor = 0; }
+        const ri = recAt(sh.off), g = ri >= 0 ? recs[ri].h : null;
+        const list = (g != null && holders.get(sc) || []).filter(x => x.H <= g && g < x.E).sort((a, b) => a.H - b.H);
+        const key = list.map(x => x.H).join(',');
+        let M = ident;
+        if (list.length) {
+          const ck = sc + ':' + key;
+          if (!mCache.has(ck)) { const acc = new THREE.Matrix4(); for (const x of list) acc.multiply(x.M); mCache.set(ck, acc); }
+          M = mCache.get(ck);
+        }
+        const last = instances[instances.length - 1];
+        if (last && last.M === M && last.parts[0].color === curColor) last.parts[0].shells.push(sh);
+        else instances.push({ parts: [{ color: curColor, shells: [sh] }], M, name: 'tv' });
+      }
+      return { shells, instances, nodes: recs.length, xfs: nxf, defs: 0, skipped: 0, unitMM: detectUnitMM(raw) ?? 304.8, format: 'OdTv (Revit)', materials: matDiffuse };
+    }
+
+    /* ================= Dựng geometry ================= */
+    function triangulateShell(sh) {
+      if (sh.tri) return sh.tri;
+      const { verts, faces } = sh, tri = [], polys = [], triFace = [];
+      let p = 0;
+      while (p < faces.length) {
+        const c = faces[p], n = Math.abs(c), idx = Array.from(faces.subarray(p + 1, p + 1 + n));
+        if (c > 0 || !polys.length) polys.push({ outer: idx, holes: [] }); else polys[polys.length - 1].holes.push(idx);
+        p += 1 + n;
+      }
+      sh.triFace = triFace;   // chỉ số mặt (face) của từng tam giác, để tô màu theo mặt
+      const V = i => new THREE.Vector3(verts[i * 3], verts[i * 3 + 1], verts[i * 3 + 2]);
+      for (let fi = 0; fi < polys.length; fi++) {
+        const { outer, holes } = polys[fi], before = tri.length;
+        const mark = () => { for (let t = before; t < tri.length; t += 3) triFace.push(fi); };
+        if (outer.length === 3 && !holes.length) { tri.push(...outer); mark(); continue; }
+        const nrm = new THREE.Vector3();   // pháp tuyến Newell
+        for (let i = 0; i < outer.length; i++) {
+          const a = V(outer[i]), b = V(outer[(i + 1) % outer.length]);
+          nrm.x += (a.y - b.y) * (a.z + b.z); nrm.y += (a.z - b.z) * (a.x + b.x); nrm.z += (a.x - b.x) * (a.y + b.y);
+        }
+        if (nrm.lengthSq() === 0) continue; nrm.normalize();
+        const u = new THREE.Vector3(Math.abs(nrm.x) > .9 ? 0 : 1, Math.abs(nrm.x) > .9 ? 1 : 0, 0).cross(nrm).normalize();
+        const w = new THREE.Vector3().crossVectors(nrm, u);
+        const to2 = i => { const q = V(i); return new THREE.Vector2(q.dot(u), q.dot(w)); };
+        const all = [...outer, ...holes.flat()];
+        for (const [a, b, c] of THREE.ShapeUtils.triangulateShape(outer.map(to2), holes.map(h => h.map(to2))))
+          tri.push(all[a], all[b], all[c]);
+        mark();
+      }
+      return (sh.tri = tri);
+    }
+    /* Kính: file không lưu transparency (header và layer A-GLAZ giống hệt phần đục),
+     * nên nhận diện theo heuristic: màu xanh (B > R) VÀ là tấm mỏng (chiều nhỏ nhất ≤ 20 mm). */
+    function isGlass(color, sh, unitMM = 1) {
+      const r = color >> 16 & 255, b = color & 255;
+      if (!(b > r + 40)) return false;
+      const v = sh.verts, mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+      for (let k = 0; k < v.length; k += 3) for (let d = 0; d < 3; d++) { mn[d] = Math.min(mn[d], v[k + d]); mx[d] = Math.max(mx[d], v[k + d]); }
+      const ext = mx.map((x, d) => (x - mn[d]) * unitMM).sort((a, c) => a - c);
+      return ext[0] <= 30 && ext[1] >= 200;
+    }
+    function buildScene(instances, debugColors, glassOn, unitMM = 1) {
+      const group = new THREE.Group(), mats = new Map(), v = new THREE.Vector3();
+      const edgeMat = new THREE.LineBasicMaterial({ color: 0x2a2d33 });
+      const glassEdge = new THREE.LineBasicMaterial({ color: 0x2a2d33, transparent: true, opacity: .35 });
+      const getMat = (color, glass) => {
+        const key = color + (glass ? ':g' : '');
+        if (!mats.has(key)) mats.set(key, glass
+          // Kính: pha màu với trắng (ảnh tham chiếu hiển thị kính xanh rất nhạt, lờ mờ thấy bên trong)
+          ? new THREE.MeshPhysicalMaterial({
+            color: new THREE.Color(color).lerp(new THREE.Color(0xffffff), 0.7), side: THREE.DoubleSide,
+            transparent: true, opacity: .5, roughness: .05, metalness: 0, depthWrite: false
+          })
+          : new THREE.MeshStandardMaterial({
+            color, side: THREE.DoubleSide, flatShading: true, roughness: .85, metalness: 0,
+            polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1
+          }));
+        return mats.get(key);
+      };
+      let vcMat = null;
+      const getVcMat = () => vcMat || (vcMat = new THREE.MeshStandardMaterial({
+        vertexColors: true, side: THREE.DoubleSide, flatShading: true, roughness: .9, metalness: 0,
+        polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1
+      }));
+      // Gộp mọi shell cùng instance + màu + loại (kính/đục) vào một BufferGeometry để giảm draw call
+      // (file Revit có > 11 000 shell; mỗi shell một mesh làm mất WebGL context).
+      instances.forEach((ins, ii) => ins.parts.forEach(part => {
+        const color = debugColors ? new THREE.Color().setHSL((ii * 0.618) % 1, .55, .6).getHex() : (part.color || 0xb0b0b0);
+        const buckets = { opaque: [], glass: [], faceCol: [] }, fcol = [], c3 = new THREE.Color();
+        for (const sh of part.shells) {
+          const glass = glassOn && !debugColors && isGlass(part.color, sh, unitMM);
+          const perFace = !debugColors && sh.faceColors;
+          const tri = triangulateShell(sh), out = buckets[perFace ? 'faceCol' : glass ? 'glass' : 'opaque'];
+          tri.forEach((vi, k) => {
+            v.set(sh.verts[vi * 3], sh.verts[vi * 3 + 1], sh.verts[vi * 3 + 2]).applyMatrix4(ins.M);
+            out.push(v.x, v.y, v.z);
+            if (perFace) {
+              const fc = sh.faceColors[sh.triFace[(k / 3) | 0]];
+              c3.setHex(fc ?? color, THREE.SRGBColorSpace);
+              fcol.push(c3.r, c3.g, c3.b);
+            }
+          });
+        }
+        for (const kind of ['opaque', 'glass', 'faceCol']) {
+          const arr = buckets[kind];
+          if (!arr.length) continue;
+          const glass = kind === 'glass';
+          const g = new THREE.BufferGeometry();
+          g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(arr), 3));
+          if (kind === 'faceCol') g.setAttribute('color', new THREE.BufferAttribute(new Float32Array(fcol), 3));
+          g.computeVertexNormals();
+          const mesh = new THREE.Mesh(g, kind === 'faceCol' ? getVcMat() : getMat(color, glass));
+          if (glass) mesh.renderOrder = 1;
+          const edges = new THREE.LineSegments(new THREE.EdgesGeometry(g, 25), glass ? glassEdge : edgeMat);
+          edges.name = 'edges'; mesh.add(edges); group.add(mesh);
+        }
+      }));
+      return group;
+    }
+
+    /* ================= Scene ================= */
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(devicePixelRatio); renderer.setSize(innerWidth, innerHeight);
+    document.body.appendChild(renderer.domElement);
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 1, 1e7);
+    const controls = new OrbitControls(camera, renderer.domElement); controls.enableDamping = true;
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8f99, 1.6));
+    const sun = new THREE.DirectionalLight(0xffffff, 1.4); sun.position.set(-1, 3, 2); scene.add(sun);
+    let root = null, parsed = null;
+    const info = document.getElementById('info');
+
+    function applyBg() { scene.background = new THREE.Color(document.getElementById('light').checked ? 0xffffff : 0x1b1e24); }
+    function show(first) {
+      if (root) scene.remove(root);
+      root = new THREE.Group();
+      root.add(buildScene(parsed.instances, document.getElementById('color').checked, document.getElementById('glass').checked, parsed.unitMM));
+      root.rotation.x = -Math.PI / 2;            // file dùng Z lên -> Three dùng Y lên
+      scene.add(root); root.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(root), c = box.getCenter(new THREE.Vector3()), s = box.getSize(new THREE.Vector3());
+      root.position.sub(c);
+      if (first) {
+        const r = Math.max(s.x, s.y, s.z);
+        camera.position.set(r * .55, r * .75, r * .75); camera.near = r / 1000; camera.far = r * 20; camera.updateProjectionMatrix();
+        controls.target.set(0, 0, 0); controls.update();
+      }
+      const nMesh = parsed.instances.reduce((a, i) => a + i.parts.reduce((b, p) => b + p.shells.length, 0), 0);
+      const k = parsed.unitMM / 1000;
+      info.innerHTML = `Định dạng: ${parsed.format}<br>${parsed.shells.length} shell, ${parsed.instances.length} entity/instance → ${nMesh} mesh<br>` +
+        `${parsed.nodes} node/bản ghi, ${parsed.xfs} transform, ${parsed.defs} block INSERT<br>` +
+        `${parsed.skipped} shell trong block không được tham chiếu (ẩn)<br>` +
+        `kích thước: ${(s.x * k).toFixed(1)} × ${(s.z * k).toFixed(1)} × ${(s.y * k).toFixed(1)} m` +
+        ` (đơn vị file: ${({ 1: 'mm', 10: 'cm', 1000: 'm', 304.8: 'feet', 25.4: 'inch' })[parsed.unitMM] || parsed.unitMM + ' mm'})`;
+      applyEdges();
+    }
+    function applyEdges() { const on = document.getElementById('edges').checked; root?.traverse(o => { if (o.name === 'edges') o.visible = on; }); }
+    async function load(buf) {
+      info.textContent = 'Đang giải mã…';
+      const raw = await readStream(buf);
+      parsed = parseScene(raw); show(true);
+    }
+    applyBg();
+    document.getElementById('edges').onchange = applyEdges;
+    document.getElementById('light').onchange = applyBg;
+    document.getElementById('color').onchange = () => parsed && show(false);
+    document.getElementById('glass').onchange = () => parsed && show(false);
+    document.getElementById('file').onchange = async e => { const f = e.target.files[0]; if (f) load(await f.arrayBuffer()); };
+    const drop = document.getElementById('drop');
+    addEventListener('dragover', e => { e.preventDefault(); drop.style.display = 'flex'; });
+    addEventListener('dragleave', () => drop.style.display = 'none');
+    addEventListener('drop', async e => { e.preventDefault(); drop.style.display = 'none'; const f = e.dataTransfer.files[0]; if (f) load(await f.arrayBuffer()); });
+    addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); renderer.setSize(innerWidth, innerHeight); });
+    renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+
+    fetch('revit.vsfx').then(r => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); })
+      .then(load).catch(e => { info.textContent = 'Không tải được file mặc định (' + e.message + '). Hãy chạy qua http server hoặc chọn file bên dưới.'; console.error(e); });
+    window.__parsed = () => parsed;
+    window.__vsfx = () => parsed && {
+      inst: parsed.instances.map(i => {
+        const b = new THREE.Box3();
+        for (const pt of i.parts) for (const sh of pt.shells) for (let k = 0; k < sh.verts.length; k += 3)
+          b.expandByPoint(new THREE.Vector3(sh.verts[k], sh.verts[k + 1], sh.verts[k + 2]).applyMatrix4(i.M));
+        return [i.name.replace('OdIfc2x3::', ''), i.parts.map(p => p.color.toString(16)).join(','), [b.min, b.max].map(v => [v.x, v.y, v.z].map(Math.round).join(' ')).join(' → '),
+          i.insert ? JSON.stringify({ P: i.insert.P.map(Math.round), a: +i.insert.ang.toFixed(3), N: i.insert.N.map(x => +x.toFixed(3)), h: i.insert.h.toString(16), own: i.own }) : ''];
+      })
+    };
+  </script>
+</body>
+
+</html>

@@ -1,0 +1,27 @@
+{
+  "name": "vsfx-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Viewer Three.js + React cho file ODA Visualize (.vsfx), parser tự viết không dùng loader",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.160.0",
+    "three-mesh-bvh": "^0.9.18"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.32",
+    "@types/react-dom": "^18.3.7",
+    "@types/three": "^0.160.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "typescript": "~5.6.3",
+    "vite": "^6.4.6"
+  }
+}
