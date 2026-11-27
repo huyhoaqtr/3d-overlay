@@ -6,7 +6,14 @@ import type { MeshData, ModelSummary, SelectionInfo, Vec3, ViewOptions } from '.
 import type { LoadStatus } from './components/ControlPanel';
 
 // Các file mẫu đặt trong public/ (Vite phục vụ ở gốc site)
-const SAMPLES = ['revit.vsfx', 'mp.vsfx', 'dont.vsfx', 'school.vsfx'] as const;
+// const SAMPLES = ['revit.vsfx', 'mp.vsfx', 'dont.vsfx', 'school.vsfx'] as const;
+const SAMPLES = Object.keys(
+  import.meta.glob('/public/*.vsfx', {
+    eager: true,
+    query: '?url',
+    import: 'default',
+  })
+).map(path => path.split('/').pop()!);
 
 /** Một file đang mở. Overlay = nhiều layer chồng lên nhau; mỗi layer có Web Worker riêng giữ model đầy đủ. */
 interface Layer {
