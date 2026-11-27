@@ -2,7 +2,7 @@
 import * as THREE from 'three';
 import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from 'three-mesh-bvh';
 import { RANGE_STRIDE } from './types';
-import type { ChunkKind, MeshData } from './types';
+import type { ChunkKind, MeshData, TextItem } from './types';
 
 // Raycast tăng tốc bằng BVH (mesh chưa có cây thì three tự rơi về duyệt từng tam giác).
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
@@ -89,7 +89,9 @@ export class SceneModel {
       const key = kind === 'faceCol' ? kind : `${kind}:${color}:${opacity}`;
       let m = mats.get(key);
       if (!m) {
-        if (kind === 'glass') {
+        if (kind === 'glass' && data.sheet) {   // bản vẽ: kính tô phẳng xanh nhạt (màu meshData đã đặt), không chiếu sáng
+          m = new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide, transparent: true, opacity: 0.6, depthWrite: false });
+        } else if (kind === 'glass') {
           // Kính xanh nhạt bán trong suốt: giữ tông màu của file (pha một ít trắng), thêm emissive
           // cùng màu để kính không bị xám khi nằm trong bóng; opacity < 1 -> vẫn lờ mờ thấy bên trong.
           const tint = new THREE.Color(color).lerp(new THREE.Color(0xffffff), GLASS.whiteMix);
@@ -97,7 +99,12 @@ export class SceneModel {
             color: tint, emissive: tint.clone().multiplyScalar(GLASS.emissive), side: THREE.DoubleSide,
             transparent: true, opacity: opacity >= 0 ? Math.min(1, GLASS.opacity * opacity / GLASS.fileOpacityRef) : GLASS.opacity, roughness: .3, metalness: 0, depthWrite: false,
           });
-        } else
+        } else if (data.sheet)   // bản vẽ: không chiếu sáng — tô phẳng đúng màu như nét in
+          m = new THREE.MeshBasicMaterial({
+            ...(kind === 'faceCol' ? { vertexColors: true } : { color }), side: THREE.DoubleSide,
+            polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,
+          });
+        else
           m = new THREE.MeshStandardMaterial({
             ...(kind === 'faceCol' ? { vertexColors: true, roughness: .9 } : { color, roughness: .85 }),
             side: THREE.DoubleSide, flatShading: true, metalness: 0,
@@ -143,8 +150,48 @@ export class SceneModel {
       this.batches.push(batch);
       this.group.add(mesh, lines);
     }
+    this.addTexts(data.texts);
     // Model đứng yên so với root: không cần cập nhật ma trận mỗi khung hình
     this.group.traverse(o => { o.matrixAutoUpdate = false; });
+  }
+
+  private textures: THREE.Texture[] = [];
+
+  /** Chữ của file bản vẽ: mỗi dòng một mặt phẳng dán texture canvas. Gốc chữ canh trái, đường cơ sở; chiều cao Revit = chiều cao
+   *  chữ hoa (Arial cao chữ hoa ≈ 0.716 em). Đặt trực tiếp ma trận vì mọi nút con tắt matrixAutoUpdate. */
+  private addTexts(texts: TextItem[]) {
+    const PX = 128, CAP = 0.716;   // px / em trong canvas
+    for (const t of texts) {
+      const em = t.height / CAP;
+      const cv = document.createElement('canvas'), g = cv.getContext('2d');
+      if (!g) continue;
+      const font = `${PX}px Arial, Helvetica, sans-serif`;
+      g.font = font;
+      const w = Math.max(8, Math.ceil(g.measureText(t.text).width) + 8);
+      cv.width = w; cv.height = Math.ceil(PX * 1.5);
+      g.font = font;                       // đặt kích thước canvas xoá trạng thái -> đặt lại
+      g.fillStyle = '#' + t.color.toString(16).padStart(6, '0');
+      g.textBaseline = 'alphabetic';
+      g.fillText(t.text, 4, PX * 1.15);
+      const tex = new THREE.CanvasTexture(cv);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.anisotropy = 4;
+      const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, depthWrite: false, side: THREE.DoubleSide });
+      const geo = new THREE.PlaneGeometry(1, 1);
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.renderOrder = 2;
+      mesh.raycast = () => {};
+      // phẳng 1×1, tâm ở giữa -> đổi về góc dưới-trái: rộng w/PX em, cao 1.5 em; đường cơ sở cách đáy 0.35 em (1.5 − 1.15)
+      const W = (w / PX) * em, H = 1.5 * em;
+      const ax = new THREE.Vector3(...t.ax), ay = new THREE.Vector3(...t.ay), az = new THREE.Vector3().crossVectors(ax, ay);
+      const o = new THREE.Vector3(...t.origin)
+        .addScaledVector(ax, -4 / PX * em).addScaledVector(ay, -0.35 * em)   // góc dưới-trái của canvas
+        .addScaledVector(ax, W / 2).addScaledVector(ay, H / 2);              // tâm mặt phẳng
+      mesh.matrix.makeBasis(ax.multiplyScalar(W), ay.multiplyScalar(H), az).setPosition(o);
+      this.textures.push(tex);
+      this.mats.push(mat);
+      this.group.add(mesh);
+    }
   }
 
   private mats: THREE.Material[] = [];
@@ -276,6 +323,7 @@ export class SceneModel {
       b.lines.geometry.dispose();
     }
     this.mats.forEach(m => m.dispose());
+    this.textures.forEach(t => t.dispose());
     this.group.clear();
   }
 }

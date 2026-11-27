@@ -17,6 +17,15 @@ export interface ViewLayer {
 }
 
 /** Thao tác chọn/ẩn mà App gọi vào Viewer. */
+/** Bản vẽ 2D (sheet): tắt xoay, chuột trái = kéo (pan), lăn = zoom; trở lại bình thường khi không còn bản vẽ. */
+function setSheetControls(c: ViewerContext, sheet: boolean) {
+  const ctl = c.controls;
+  ctl.enableRotate = !sheet;
+  ctl.mouseButtons = { LEFT: sheet ? THREE.MOUSE.PAN : THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+  ctl.touches = { ONE: sheet ? THREE.TOUCH.PAN : THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
+  ctl.screenSpacePanning = true;
+}
+
 export interface ViewerHandle {
   hideSelected(): void;
   isolateSelected(): void;
@@ -261,7 +270,7 @@ const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
       c.layers.delete(key);
       changed = true;
     }
-    if (!keepsAny) { c.anchored = false; c.world.position.set(0, 0, 0); }
+    if (!keepsAny) { c.anchored = false; c.world.position.set(0, 0, 0); setSheetControls(c, false); }
 
     for (const l of layers) {
       if (c.layers.has(l.key)) continue;
@@ -293,7 +302,9 @@ const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
         const center = box.getCenter(new THREE.Vector3());
         c.world.position.sub(center);
         const r = Math.max(size.x, size.y, size.z) || 1;
-        c.camera.position.set(r * .55, r * .75, r * .75);
+        // file bản vẽ (sheet): nhìn thẳng từ trên xuống, trục Y của giấy hướng lên màn hình (y file = −z Three)
+        if (l.data.sheet) { c.camera.position.set(0, r * 1.1, r * 0.002); setSheetControls(c, true); }
+        else c.camera.position.set(r * .55, r * .75, r * .75);
         c.camera.near = r / 2000;
         c.camera.far = r * 50;
         c.camera.updateProjectionMatrix();

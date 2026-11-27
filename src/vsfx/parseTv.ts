@@ -14,7 +14,7 @@
 import * as THREE from 'three';
 import { views, scanTransforms, lastLE, identity } from './scan';
 import { detectUnitMM } from './units';
-import type { Instance, Shell, VsfxModel } from './types';
+import type { Instance, SheetView, Shell, VsfxModel } from './types';
 
 interface TvRecord {
   o: number;
@@ -32,9 +32,16 @@ interface Holder {
 function scanRecords(raw: Uint8Array): TvRecord[] {
   const L = raw.length, { u32 } = views(raw);
   const isPfx = (q: number) => raw[q] === 0x0c && raw[q + 1] === 0x02 && !raw[q + 2] && !raw[q + 3] && !raw[q + 4];
+  // Bản ghi mở đầu bằng 50 00 11 (mọi file Revit mẫu). File BẢN VẼ (sheet3.vsfx: 8 546 bản ghi 40 00 11, chỉ 32 cái 50 00 11 là
+  // byte lẫn trong dữ liệu) dùng 40 00 11 — bỏ qua thì không có cây bản ghi, mọi ma trận/handle mất, cả mô hình dồn về gốc toạ độ.
+  // Chỉ chuyển sang 40 khi nó áp đảo hẳn: file_1/file_5 có lẻ tẻ vài bản ghi 40 (1 và 357) mà nhận vào sẽ đổi ma trận của 4 / 204 shell.
+  let n50 = 0, n40 = 0;
+  for (let o = 0; o + 40 <= L; o++)
+    if (raw[o + 1] === 0x00 && raw[o + 2] === 0x11) { if (raw[o] === 0x50) n50++; else if (raw[o] === 0x40) n40++; }
+  const lead = n40 > 4 * n50 ? 0x40 : 0x50;
   const starts: number[] = [];
   for (let o = 0; o + 40 <= L; o++)
-    if (raw[o] === 0x50 && raw[o + 1] === 0x00 && raw[o + 2] === 0x11) starts.push(o);
+    if (raw[o] === lead && raw[o + 1] === 0x00 && raw[o + 2] === 0x11) starts.push(o);
   return starts.map((o, i) => {
     const end = i + 1 < starts.length ? starts[i + 1] : L;
     const r: TvRecord = { o, end, h: null, kids: [] };
@@ -325,8 +332,8 @@ export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
     // ảnh chuẩn đều xám. Shell thường có f2 = 03 kèm màu thật. (Suy luận từ 2 file, chưa có spec.)
     const gc = geometryColor(raw, sh.off - 9);
     // đường gấp khúc (kiểu 05) có bản ghi màu riêng, không được làm nhiễu màu dính (baseColor/ownColor) của các shell
-    if (!sh.line && gc.k === 'base') { baseColor = gc.c; ownColor = 0; }
-    if (!sh.line && gc.k === 'own') { ownColor = gc.c; baseColor = 0; }
+    if (!sh.line && !sh.text && gc.k === 'base') { baseColor = gc.c; ownColor = 0; }
+    if (!sh.line && !sh.text && gc.k === 'own') { ownColor = gc.c; baseColor = 0; }
     let col = gc.k === 'material' ? 0 : gc.k === 'base' ? gc.c : gc.k === 'unset' && baseColor ? baseColor : curColor, alpha = 1;
     const mi = lastLE(matUse, sh.off, x => x.o), mat = mi >= 0 && scopeOf(matUse[mi].o) === sc ? matUse[mi] : null;
     const glassMat = !!mat && mat.a < 1;
@@ -339,6 +346,9 @@ export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
     else if (gc.k === 'unset' && ownColor) col = ownColor;
     // Shell có màu / vật liệu ghi ngay trong header của nó: ưu tiên hơn màu entity (giống màu theo face)
     if (sh.color) col = sh.color;
+    // Chữ: màu trong bản ghi màu; không có -> đen (màu đối tượng ở đây là trắng của khung giấy, từng làm "A103" trắng trên giấy trắng).
+    // Màu xanh lá của nhãn view KHÔNG nằm trong bản ghi màu hay vật liệu gần đó (đã dò) -> hiệu chỉnh theo ảnh ở meshData (viewLabel).
+    if (sh.text) { const tc = lineColor(raw, sh.off - 2); col = tc > 0 ? tc : 0x0a0a0a; alpha = 1; }
     if (sh.line) { const lc = lineColor(raw, sh.off - 9); col = lc >= 0 ? (lc || 0x0a0a0a) : (curColor || 0x0a0a0a); alpha = 1; }
     if (sh.mat !== undefined && materials.has(sh.mat)) alpha = opacity.get(sh.mat) ?? 1;
     const last = instances[instances.length - 1], grp = groupOf(ck);
@@ -359,8 +369,14 @@ export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
     }   // cùng scope + cùng chuỗi ma trận = một đối tượng (vd ghế = mặt ghế + chân khác màu)
   }
   removeTextPlates(instances);
+  // Mọi bước sau làm việc trên danh sách ĐÃ BỎ instance rỗng — đúng danh sách mà meshData dùng (chỉ số from/to của view phải khớp)
+  const live = instances.filter(i => i.parts.some(p => p.shells.length));
+  if (shells.some(sh => sh.text)) inheritLostMatrices(live);   // file bản vẽ
+  const sheet = markPaperSpace(live);
+  const views = sheet ? markViews(live) : undefined;
+  if (views) fixHeadTexts(live, views);
   return {
-    format: 'OdTv (Revit)', shells, instances: instances.filter(i => i.parts.some(p => p.shells.length)), records: recs.length, transforms: nxf,
+    format: 'OdTv (Revit)', sheet, views, shells, instances: live, records: recs.length, transforms: nxf,
     inserts: 0, skipped: 0, unitMM: detectUnitMM(raw) ?? 304.8, materials,
   };
 }
@@ -412,4 +428,179 @@ function removeTextPlates(instances: Instance[]) {
     for (const ins of list) for (const p of ins.parts) p.shells = p.shells.filter(sh => !plate.has(sh));
     for (const ins of list) ins.parts = ins.parts.filter(p => p.shells.length);
   }
+}
+
+/* File BẢN VẼ (Revit sheet; sheet3.vsfx): trang giấy (paper space) gồm khung + khung tên (đường) và chữ nằm trong toạ độ giấy (feet,
+ * gốc ở góc dưới trái, A1 ≈ 2.76 × 1.95), còn mô hình 3D nằm ở toạ độ ±100 ft — thu nhỏ 1:100 qua viewport. Nhận diện:
+ *  - KHUNG: instance có ≥ 8 đường phẳng, bbox local bắt đầu ở gốc (≈ 0,0), rộng ≥ 1 và dài/cao 1.2–1.6 (khung giấy);
+ *  - trang giấy = mọi instance CÙNG handle với khung (chữ khung tên bị gán nhầm ma trận đặt tờ giấy vào không gian 3D (85.7, −7.2, 19.7)
+ *    nên dùng toạ độ local = toạ độ giấy) + instance có đường/chữ mà bbox world (XY) nằm trong khung (nhãn "South", "1 : 100"…).
+ * Trả true nếu tìm được khung. Suy luận từ một file (sheet3.vsfx), chưa có spec. */
+function markPaperSpace(instances: Instance[]): boolean {
+  let frame: Instance | null = null, fr: number[] = [], frameLines = 0;
+  for (const ins of instances) {
+    const b = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
+    let lines = 0, other = 0;
+    for (const p of ins.parts) for (const sh of p.shells) {
+      if (!sh.line) { other++; continue; }
+      lines++;
+      for (let k = 0; k + 2 < sh.verts.length; k += 3)
+        for (let d = 0; d < 3; d++) { if (sh.verts[k + d] < b[d]) b[d] = sh.verts[k + d]; if (sh.verts[k + d] > b[d + 3]) b[d + 3] = sh.verts[k + d]; }
+    }
+    if (lines < 8 || other) continue;
+    const w = b[3] - b[0], h = b[4] - b[1], r = w / (h || 1);
+    // nhiều ứng viên (khung cắt của từng view cũng dạng này, vd 12 đường 3.71 × 2.95): lấy cái nhiều đường nhất = khung giấy + khung tên
+    if (w >= 1 && Math.abs(b[0]) < 0.05 * w && Math.abs(b[1]) < 0.05 * h && b[5] - b[2] < 1e-6 && r > 1.2 && r < 1.6 && lines > frameLines) { frame = ins; fr = b; frameLines = lines; }
+  }
+  if (!frame) return false;
+  const w = fr[3] - fr[0], h = fr[4] - fr[1], ident = new THREE.Matrix4(), saved: [Instance, THREE.Matrix4][] = [];
+  const placed: THREE.Matrix4[] = [];   // ma trận đặt tờ giấy vào không gian 3D (gán nhầm cho chữ khung tên)
+  const lo = [fr[0] - 0.05 * w, fr[1] - 0.05 * h], hi = [fr[3] + 0.05 * w, fr[4] + 0.05 * h];
+  for (const ins of instances) {
+    if (ins.handle === frame.handle) {
+      saved.push([ins, ins.M]);
+      if (ins.M.elements.some((x, i) => Math.abs(x - ident.elements[i]) > 1e-9) && !placed.some(m => m.equals(ins.M))) placed.push(ins.M);
+      ins.M = ident; ins.paper = true; continue;
+    }
+    let has2d = false;
+    const b = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity], e = ins.M.elements;
+    for (const p of ins.parts) for (const sh of p.shells) {
+      if (sh.line || sh.text) has2d = true;
+      for (let k = 0; k + 2 < sh.verts.length; k += 3)
+        for (let d = 0; d < 3; d++) {
+          const v = e[d] * sh.verts[k] + e[d + 4] * sh.verts[k + 1] + e[d + 8] * sh.verts[k + 2] + e[d + 12];
+          if (v < b[d]) b[d] = v;
+          if (v > b[d + 3]) b[d + 3] = v;
+        }
+    }
+    if (has2d && b[0] >= lo[0] && b[1] >= lo[1] && b[3] <= hi[0] && b[4] <= hi[1]) { ins.paper = true; ins.viewLabel = true; }
+  }
+  // Các thực thể khác của trang giấy (đầu bảng sửa đổi "Description"/"Date", dòng bảng…) cũng mang đúng ma trận đặt tờ giấy ấy nhưng khác handle
+  for (const ins of instances) {
+    if (ins.paper || !placed.some(m => m.equals(ins.M))) continue;
+    // chỉ nhận khi MỌI toạ độ local nằm trong khổ giấy (instance cùng ma trận nhưng có đường toạ độ mô hình tuyệt đối thì không phải giấy)
+    let inside = true, far = false;
+    for (const p of ins.parts) for (const sh of p.shells)
+      for (let k = 0; k + 2 < sh.verts.length && inside; k += 3) {
+        if (sh.verts[k] < lo[0] || sh.verts[k] > hi[0] || sh.verts[k + 1] < lo[1] || sh.verts[k + 1] > hi[1]) inside = false;
+        if (Math.abs(sh.verts[k]) > 0.5 || Math.abs(sh.verts[k + 1]) > 0.5) far = true;
+      }
+    // chi tiết nhỏ kiểu in gần gốc (đầu level "Roof Line" của view Section: ma trận (85.7, −7.16, 19.69) TRÙNG ma trận đặt tờ giấy) cần chính ma trận đó -> không phải giấy
+    if (!inside || !far) continue;
+    saved.push([ins, ins.M]); ins.M = ident; ins.paper = true;
+  }
+  // Một khung giấy mà không có chữ khung tên thì không phải file bản vẽ (revit.vsfx có vài khung 2D tương tự): huỷ.
+  let texts = 0;
+  for (const ins of instances) if (ins.paper) for (const p of ins.parts) for (const sh of p.shells) if (sh.text) texts++;
+  if (texts < 5) {
+    for (const ins of instances) { ins.paper = undefined; ins.viewLabel = undefined; }
+    for (const [ins, M] of saved) ins.M = M;
+    return false;
+  }
+  return true;
+}
+
+/* Viewport của file bản vẽ — HIỆU CHỈNH THEO ẢNH GỐC (sheet3.vsfx), không đọc từ file:
+ *  - mỗi view là một BẢN SAO cả mô hình; chú thích của view (lưới, level, chữ) nằm trên mặt phẳng y = y0 (−62.49 South, −7.16 Section) và
+ *    đứng ở CUỐI bản sao nên instance cuối cùng của mặt phẳng đó đánh dấu hết bản sao (bản sao đầu: 0…; bản sau: ngay sau đó…);
+ *  - tỉ lệ 1:100 (chữ " 1 : 100" của view); giấy = (a + s·X, b + s·Z) đo từ ảnh gốc: lưới 1…7 cách 9.84 ft → 0.0984 ft giấy, Level 1 ở y giấy 1.44 (South)
+ *    và 0.671 (Section), lưới 1 ở x giấy 0.692 (a = 0.854);
+ *  - khung cắt = vùng viewport suy từ ảnh (nhãn "South"/"Longitudinal Section" nằm dưới góc trái khung);
+ *  - độ sâu cắt: ước lượng, chỉnh theo hình (nhà không hiện ở view South dù bản sao có đủ nhà).
+ * Mặt phẳng lạ (không có trong bảng) -> bỏ qua, view đó không vẽ. */
+const VIEW_PRESETS: { y0: number; a: number; b: number; crop: [number, number, number, number]; depth: number; slab: 'inside' | 'touch' | 'cut' }[] = [
+  { y0: -62.49, a: 0.854, b: 1.44, crop: [0.1, 1.3, 1.9, 1.9], depth: 1, slab: 'inside' },
+  { y0: -7.16, a: 0.854, b: 0.671, crop: [0.1, 0.52, 1.9, 1.12], depth: 0.3, slab: 'cut' },
+];
+
+function markViews(instances: Instance[]): SheetView[] {
+  // mặt phẳng chú thích: instance không phải giấy, phẳng theo Y, có chữ
+  const planes = new Map<number, number>();   // y0 (làm tròn 0.01) -> chỉ số instance cuối có chú thích
+  instances.forEach((ins, i) => {
+    if (ins.paper) return;
+    let hasText = false;   // có chữ HOẶC đường (đường level phụ không có chữ đi kèm trong cùng instance nhưng vẫn nằm trên mặt phẳng view)
+    let lo = Infinity, hi = -Infinity;
+    const e = ins.M.elements;
+    for (const p of ins.parts) for (const sh of p.shells) {
+      if (sh.text || (sh.line && !sh.circle)) hasText = true;
+      for (let k = 0; k + 2 < sh.verts.length; k += 3) {
+        const y = e[1] * sh.verts[k] + e[5] * sh.verts[k + 1] + e[9] * sh.verts[k + 2] + e[13];
+        if (y < lo) lo = y;
+        if (y > hi) hi = y;
+      }
+    }
+    if (hasText && hi - lo < 0.05) planes.set(Math.round(lo * 100) / 100, i);
+  });
+  // chỉ các mặt phẳng có trong bảng hiệu chỉnh (đường phẳng ở các mặt phẳng khác — vd y = −11.27 — là chi tiết của mô hình, không phải ranh giới view)
+  const ordered = [...planes.entries()].filter(([y]) => VIEW_PRESETS.some(p => Math.abs(p.y0 - y) < 0.05)).sort((a, b) => a[1] - b[1]);
+  const out: SheetView[] = [];
+  let from = 0;
+  ordered.forEach(([y0, last0], k) => {
+    // bản sao cuối kéo dài tới trước instance trang giấy đầu tiên đứng sau nó (sau chú thích vẫn còn vài instance của bản sao)
+    let last = last0;
+    if (k === ordered.length - 1) { const nextPaper = instances.findIndex((ins, i) => i > last0 && ins.paper); last = nextPaper > 0 ? nextPaper - 1 : instances.length - 1; }
+    const preset = VIEW_PRESETS.find(p => Math.abs(p.y0 - y0) < 0.05);
+    if (preset) out.push({ from, to: last, y0, a: preset.a, b: preset.b, s: 0.01, depth: preset.depth, slab: preset.slab, crop: preset.crop });
+    from = last + 1;
+  });
+  return out;
+}
+
+/* Số lưới ở đầu vòng tròn: chữ "1" của view South bị rơi về gốc toạ độ (ma trận instance là đơn vị, dù cái vòng tròn cùng đầu lưới có ma trận đúng) -> thấy
+ * số 1 lạc ra ngoài vòng. Với mỗi view: chữ nhỏ ở gốc (|toạ độ local| < 0.05, M đơn vị) được ghép với vòng tròn chưa có chữ nào nằm trong (so theo vị trí world),
+ * rồi đặt ma trận riêng (`textM`) = ma trận của vòng tròn đó. Ghép tuần tự theo thứ tự trong file. Heuristic suy từ sheet3.vsfx. */
+function fixHeadTexts(instances: Instance[], views: SheetView[]) {
+  for (const v of views) {
+    const circles: { M: THREE.Matrix4; sh: Shell; w: THREE.Vector3 }[] = [];
+    const lost: { sh: Shell }[] = [];
+    const placed: THREE.Vector3[] = [];
+    for (let i = v.from; i <= v.to; i++) {
+      const ins = instances[i];
+      if (ins.paper) continue;
+      const e = ins.M.elements, atOrigin = e[12] === 0 && e[13] === 0 && e[14] === 0;
+      for (const p of ins.parts) for (const sh of p.shells) {
+        if (sh.circle) { const c = sh.circle.c; circles.push({ M: ins.M, sh, w: new THREE.Vector3(c[0], c[1], c[2]).applyMatrix4(ins.M) }); }
+        else if (sh.text) {
+          if (atOrigin && Math.abs(sh.verts[0]) < 0.05 && Math.abs(sh.verts[1]) < 0.05) lost.push({ sh });
+          else placed.push(new THREE.Vector3(sh.verts[0], sh.verts[1], 0).applyMatrix4(ins.M));
+        }
+      }
+    }
+    // chỉ ghép với vòng cùng bán kính với các vòng ĐÃ có chữ ở giữa (đầu lưới); vòng đầu level (bán kính khác, chữ nằm lệch bên cạnh) không nhận
+    const withText = circles.filter(c => c.sh.circle && placed.some(q => q.distanceTo(c.w) < c.sh.circle!.r * 2));
+    const free = circles.filter(c => c.sh.circle && !withText.includes(c) && withText.some(w => Math.abs(w.sh.circle!.r - c.sh.circle!.r) < 0.05 * c.sh.circle!.r));
+    lost.forEach((t, k) => {
+      const c = free[k];
+      if (!c || !c.sh.circle) return;
+      const cc = c.sh.circle.c;
+      t.sh.verts = new Float64Array([t.sh.verts[0] + cc[0], t.sh.verts[1] + cc[1], t.sh.verts[2] + cc[2]]);
+      t.sh.textM = c.M;
+    });
+  }
+}
+
+/* Đầu level/lưới của view có khi MẤT ma trận (M = đơn vị, nằm ở gốc toạ độ): đầu "Roof Line" của view Section (instance cùng handle 196629 với đường level có ma trận
+ * (85.7, −7.2, 19.7)). Ở view South cái đầu này có ma trận đúng. Chỉ với instance nhỏ kiểu in (mọi toạ độ local < 0.5 ft) và M đơn vị: nhận ma trận của instance KHÁC cùng handle
+ * có ma trận không phải đơn vị (khung/khung tên toạ độ lớn hơn 0.5 ft nên không bị đụng). Nếu không sửa, các instance này bị coi là trang giấy (nằm gọn trong khổ giấy). */
+function inheritLostMatrices(instances: Instance[]) {
+  const isIdent = (M: THREE.Matrix4) => M.elements.every((x, i) => Math.abs(x - (i % 5 === 0 ? 1 : 0)) < 1e-9);
+  const byHandle = new Map<string, number[]>();
+  instances.forEach((ins, i) => { if (ins.handle) (byHandle.get(ins.handle) ?? byHandle.set(ins.handle, []).get(ins.handle)!).push(i); });
+  const small = (ins: Instance) => ins.parts.every(p => p.shells.every(sh => {
+    if (sh.text?.abs) return false;
+    for (let k = 0; k < sh.verts.length; k++) if (Math.abs(sh.verts[k]) >= 0.5) return false;
+    return true;
+  }));
+  const fix: [Instance, THREE.Matrix4][] = [];
+  for (const list of byHandle.values()) {
+    for (const i of list) {
+      const ins = instances[i];
+      if (!isIdent(ins.M) || !small(ins) || !ins.parts.some(p => p.shells.length)) continue;
+      // cùng handle xuất hiện ở cả hai view (đầu level 311 ở South lẫn Section): lấy instance CÓ MA TRẬN gần nhất theo thứ tự (cùng bản sao)
+      let best = -1;
+      for (const j of list) if (j !== i && !isIdent(instances[j].M) && !instances[j].paper && (best < 0 || Math.abs(j - i) < Math.abs(best - i))) best = j;
+      if (best >= 0) fix.push([ins, instances[best].M]);
+    }
+  }
+  for (const [ins, M] of fix) ins.M = M;
 }

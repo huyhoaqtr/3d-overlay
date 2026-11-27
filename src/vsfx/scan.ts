@@ -136,6 +136,72 @@ export function scanLines(raw: Uint8Array): Shell[] {
   return lines;
 }
 
+/* Vòng tròn (hình học kiểu 00 — file bản vẽ: vòng quanh số lưới của view; sheet3.vsfx có 26 cái):
+ *   01 00 00 00 00 | 00 00 00 00 | 0C 00 00 00 00 | tâm (x, y, z: 3 × f64) | bán kính (f64)
+ * Nằm trong mặt phẳng XY local (cùng mặt phẳng với chữ của đầu lưới). Suy luận từ 26 cái (bán kính 0.0132–0.0214 ft ≈ 4–6.5 mm giấy); trả về đường gấp khúc kín
+ * (33 điểm) để dùng chung đường vẽ `wire`. */
+export function scanCircles(raw: Uint8Array): Shell[] {
+  const L = raw.length, { f64 } = views(raw), out: Shell[] = [];
+  const SEG = 32;
+  for (let o = 4; o + 43 <= L; o++) {
+    if (raw[o - 4] !== 1 || raw[o - 3] || raw[o - 2] || raw[o - 1] || raw[o] || raw[o + 1] || raw[o + 2] || raw[o + 3] || raw[o + 4] ||
+        raw[o + 5] !== 0x0c || raw[o + 6] || raw[o + 7] || raw[o + 8] || raw[o + 9]) continue;
+    const c = o + 10, cx = f64(c), cy = f64(c + 8), cz = f64(c + 16), r = f64(c + 24);
+    if (![cx, cy, cz, r].every(Number.isFinite) || !(r > 1e-4 && r < 1e3) || Math.abs(cx) > 1e5 || Math.abs(cy) > 1e5 || Math.abs(cz) > 1e5) continue;
+    const v = new Float64Array((SEG + 1) * 3);
+    for (let i = 0; i <= SEG; i++) {
+      const t = (i / SEG) * 2 * Math.PI;
+      v[i * 3] = cx + r * Math.cos(t); v[i * 3 + 1] = cy + r * Math.sin(t); v[i * 3 + 2] = cz;
+    }
+    out.push({ off: c, end: c + 32, verts: v, faces: new Int32Array(0), faceColors: null, line: true, circle: { c: [cx, cy, cz], r } });
+    o = c + 31;
+  }
+  return out;
+}
+
+/* Thực thể chữ (file bản vẽ Revit/sheet3.vsfx; suy luận từ 79 dòng chữ, đối chiếu vị trí với ảnh gốc):
+ *   0C 00 [2 byte] 00 0D | x y x y (4 × f64, cặp sau lặp lại cặp đầu) | 01 | rộng-tỉ-lệ (f64, 1.0) | cao chữ (f64) | u16 số ký tự | UTF-16
+
+ *   Biến thể TUYỆT ĐỐI (nhãn "Level 2", "Foundation", "Level 1 Living Rm.", giá trị cao độ của view): `0C 00 46 20 00 0C [f64 = |y0| của view] x y x y` rồi `00 | góc (≈0) | −1.0 | 0.0 | 1.0 | cao | u16 | UTF-16` —
+ *   toạ độ là toạ độ MÔ HÌNH (x = X, y = Z) và cao chữ cũng theo đơn vị mô hình (0.984 ft = 3 mm × 100), khác các nhãn kia dùng kích thước giấy.
+ *   Chữ XOAY (byte cờ 05 thay 0D; ngày giờ ở mép phải khổ giấy, xoay 90°): sau `01` có thêm góc quay (f64, radian) trước rộng-tỉ-lệ.
+ * Gốc chữ canh TRÁI, đường cơ sở (khớp "Elevations/Sections" tràn ra trái khung tên ở ảnh gốc). Đơn vị feet, toạ độ giấy gốc ở góc
+ * dưới trái khổ giấy (A1 ≈ 2.76 × 1.95 ft). Trả về giả-shell: verts = [x, y, 0] ở hệ local, `text` giữ cao + chuỗi. */
+export function scanTexts(raw: Uint8Array): Shell[] {
+  const L = raw.length, { f64 } = views(raw), out: Shell[] = [];
+  for (let o = 5; o + 54 <= L; o++) {
+    if (o >= 12 && raw[o - 8] === 0x0c && !raw[o - 9] && raw[o - 10] === 0x20 && raw[o - 11] === 0x46 && !raw[o - 12] && !raw[o + 33] && f64(o + 42) === -1 && f64(o + 58) === 1) {   // biến thể tuyệt đối (8 byte trước x là một f64 = |y0| của view)
+      const x = f64(o + 1), y = f64(o + 9), h = f64(o + 66), n = raw[o + 74] | (raw[o + 75] << 8), t0 = o + 76;
+      if (!(Math.abs(x) < 1e6 && Math.abs(y) < 1e6) || f64(o + 17) !== x || f64(o + 25) !== y || !(h > 0 && h < 1e3) || n < 1 || n > 200 || t0 + n * 2 > L) continue;
+      let s = '', ok = true;
+      for (let i = 0; i < n; i++) { const c = raw[t0 + i * 2] | (raw[t0 + 1 + i * 2] << 8); if (c < 0x20 || (c >= 0xd800 && c < 0xe000)) { ok = false; break; } s += String.fromCharCode(c); }
+      if (!ok) continue;
+      out.push({ off: o + 1, end: t0 + n * 2, verts: new Float64Array([x, y, 0]), faces: new Int32Array(0), faceColors: null, text: { h, s, rot: 0, abs: true } });
+      o = t0 + n * 2 - 1;
+      continue;
+    }
+    if ((raw[o] !== 0x0d && raw[o] !== 0x05) || raw[o - 1] || raw[o - 5] !== 0x0c || raw[o - 4] || raw[o + 33] !== 1) continue;
+    const x = f64(o + 1), y = f64(o + 9);
+    if (!(Math.abs(x) < 1e6 && Math.abs(y) < 1e6) || f64(o + 17) !== x || f64(o + 25) !== y) continue;
+    const rotated = f64(o + 34) !== 1, rot = rotated ? f64(o + 34) : 0, b = rotated ? o + 50 : o + 42;   // b = vị trí cao chữ
+    if (rotated && !(Math.abs(rot) < 7)) continue;
+    const h = f64(b);
+    if (!(h > 0 && h < 1e3)) continue;
+    const n = raw[b + 8] | (raw[b + 9] << 8), t0 = b + 10;
+    if (n < 1 || n > 200 || t0 + n * 2 > L) continue;
+    let s = '', ok = true;
+    for (let i = 0; i < n; i++) {
+      const c = raw[t0 + i * 2] | (raw[t0 + 1 + i * 2] << 8);
+      if (c < 0x20 || (c >= 0xd800 && c < 0xe000) || c === 0xfffe || c === 0xffff) { ok = false; break; }
+      s += String.fromCharCode(c);
+    }
+    if (!ok) continue;
+    out.push({ off: o + 1, end: t0 + n * 2, verts: new Float64Array([x, y, 0]), faces: new Int32Array(0), faceColors: null, text: { h, s, rot } });
+    o = t0 + n * 2 - 1;
+  }
+  return out;
+}
+
 /* Ma trận trực giao: 3 double tịnh tiến + 9 double xoay (lưu theo hàng); world = Mᵀ·v + t.
  * Gọi onMatrix(offset, Matrix4) cho mỗi bản ghi tìm thấy. */
 export function scanTransforms(raw: Uint8Array, start: number, onMatrix: (off: number, M: THREE.Matrix4) => void): void {
