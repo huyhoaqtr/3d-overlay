@@ -77,6 +77,14 @@ export class SceneModel {
     const glassEdge = new THREE.LineBasicMaterial({ color: EDGE_COLOR, transparent: true, opacity: .35 });
     this.mats = [edgeMat, glassEdge];
 
+    // Đường gấp khúc (kiểu 05): vẽ bằng màu riêng của file, không theo màu cạnh chung
+    const wireMats = new Map<number, THREE.LineBasicMaterial>();
+    const wireMat = (color: number) => {
+      let m = wireMats.get(color);
+      if (!m) { m = new THREE.LineBasicMaterial({ color }); wireMats.set(color, m); this.mats.push(m); }
+      return m;
+    };
+
     const getMat = (kind: string, color: number, opacity: number): THREE.Material => {
       const key = kind === 'faceCol' ? kind : `${kind}:${color}:${opacity}`;
       let m = mats.get(key);
@@ -108,18 +116,20 @@ export class SceneModel {
       g.setAttribute('normal', new THREE.BufferAttribute(c.normals, 3));
       if (c.colors) g.setAttribute('color', new THREE.BufferAttribute(c.colors, 3));
       g.setIndex(new THREE.BufferAttribute(vIndex, 1));
-      g.computeBoundingSphere();
-      const mesh = new THREE.Mesh(g, getMat(c.kind, c.color, c.opacity));
+      const wire = c.kind === 'wire';
+      if (!wire) g.computeBoundingSphere();
+      const mesh = new THREE.Mesh(g, wire ? edgeMat : getMat(c.kind, c.color, c.opacity));
       if (c.kind === 'glass') mesh.renderOrder = 1;
+      if (wire) mesh.visible = false;      // không có mặt, chỉ có đoạn thẳng
 
       const eIndex = iota(c.edges.length / 3);
       const eg = new THREE.BufferGeometry();
       eg.setAttribute('position', new THREE.BufferAttribute(c.edges, 3));
       eg.setIndex(new THREE.BufferAttribute(eIndex, 1));
       eg.computeBoundingSphere();
-      const lines = new THREE.LineSegments(eg, c.kind === 'glass' ? glassEdge : edgeMat);
+      const lines = new THREE.LineSegments(eg, wire ? wireMat(c.color) : c.kind === 'glass' ? glassEdge : edgeMat);
       lines.name = 'edges';
-      lines.raycast = () => {};        // chỉ chọn theo mặt, không theo cạnh
+      if (!wire) lines.raycast = () => {};        // chỉ chọn theo mặt, không theo cạnh (đường dữ liệu kiểu 05 thì chọn được)
 
       const ranges: PartRange[] = [];
       for (let k = 0; k < c.ranges.length; k += RANGE_STRIDE)
@@ -162,7 +172,7 @@ export class SceneModel {
   }
 
   setEdgesVisible(visible: boolean) {
-    for (const b of this.batches) b.lines.visible = visible;
+    for (const b of this.batches) if (b.kind !== 'wire') b.lines.visible = visible;   // đường dữ liệu (kiểu 05) không phải cạnh
   }
 
   /** Entity chứa tam giác `faceIndex` của batch (tìm nhị phân theo vStart). */
@@ -173,6 +183,19 @@ export class SceneModel {
       const mid = (lo + hi) >> 1;
       if (v < r[mid].vStart) hi = mid - 1;
       else if (v >= r[mid].vStart + r[mid].vCount) lo = mid + 1;
+      else return r[mid].entity;
+    }
+    return null;
+  }
+
+  /** Entity chứa đoạn thẳng `edgeIndex` (vị trí trong index buffer cạnh) của batch 'wire' (tìm nhị phân theo eStart). */
+  entityAtEdge(batch: Batch, edgeIndex: number): number | null {
+    const r = batch.ranges;
+    let lo = 0, hi = r.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (edgeIndex < r[mid].eStart) hi = mid - 1;
+      else if (edgeIndex >= r[mid].eStart + r[mid].eCount) lo = mid + 1;
       else return r[mid].entity;
     }
     return null;
@@ -221,7 +244,7 @@ export class SceneModel {
 
   /** Dựng BVH (indirect: không đảo index buffer, nên bảng range vẫn đúng) cho batch chưa có. */
   private buildBvh(b: Batch) {
-    if (b.bvh) return;
+    if (b.bvh || b.kind === 'wire') return;
     (b.mesh.geometry as THREE.BufferGeometry & { computeBoundsTree(o?: object): void }).computeBoundsTree({ indirect: true });
     b.bvh = true;
   }

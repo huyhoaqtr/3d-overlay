@@ -151,6 +151,17 @@ function geometryColor(raw: Uint8Array, h: number): GeometryColor {
   return { k: 'unset' };
 }
 
+/** Màu của đường gấp khúc (kiểu 05): bản ghi `0D 04|06 00 00 [f1 f2] 00 [B G R] C2` ngay trước header; -1 nếu không có.
+ *  000000 là màu đen thật (file_5.vsfx: 118 đường đen) chứ không phải "không đặt màu" như ở shell. */
+function lineColor(raw: Uint8Array, h: number): number {
+  for (let q = h - 1; q >= Math.max(0, h - 60); q--) {
+    if (raw[q] !== 0x0d || (raw[q + 1] !== 4 && raw[q + 1] !== 6) || raw[q + 2] || raw[q + 3] || raw[q + 6] || (raw[q + 10] !== 0xc2 && raw[q + 10] !== 0xc0)) continue;
+    if (raw[q + 10] === 0xc0) return -1;   // ByLayer: không có màu riêng -> dùng màu đối tượng
+    return (raw[q + 9] << 16) | (raw[q + 8] << 8) | raw[q + 7];
+  }
+  return -1;
+}
+
 function scanColors(raw: Uint8Array): { o: number; c: number }[] {
   const L = raw.length, colors: { o: number; c: number }[] = [];
   for (let q = 17; q + 12 <= L; q++) {
@@ -313,8 +324,9 @@ export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
     // cây / bụi / người (revit.vsfx: đúng 10 shell; school.vsfx: các cây) — từng làm 1 cây be, 1 cây vàng trong khi
     // ảnh chuẩn đều xám. Shell thường có f2 = 03 kèm màu thật. (Suy luận từ 2 file, chưa có spec.)
     const gc = geometryColor(raw, sh.off - 9);
-    if (gc.k === 'base') { baseColor = gc.c; ownColor = 0; }
-    if (gc.k === 'own') { ownColor = gc.c; baseColor = 0; }
+    // đường gấp khúc (kiểu 05) có bản ghi màu riêng, không được làm nhiễu màu dính (baseColor/ownColor) của các shell
+    if (!sh.line && gc.k === 'base') { baseColor = gc.c; ownColor = 0; }
+    if (!sh.line && gc.k === 'own') { ownColor = gc.c; baseColor = 0; }
     let col = gc.k === 'material' ? 0 : gc.k === 'base' ? gc.c : gc.k === 'unset' && baseColor ? baseColor : curColor, alpha = 1;
     const mi = lastLE(matUse, sh.off, x => x.o), mat = mi >= 0 && scopeOf(matUse[mi].o) === sc ? matUse[mi] : null;
     const glassMat = !!mat && mat.a < 1;
@@ -327,6 +339,7 @@ export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
     else if (gc.k === 'unset' && ownColor) col = ownColor;
     // Shell có màu / vật liệu ghi ngay trong header của nó: ưu tiên hơn màu entity (giống màu theo face)
     if (sh.color) col = sh.color;
+    if (sh.line) { const lc = lineColor(raw, sh.off - 9); col = lc >= 0 ? (lc || 0x0a0a0a) : (curColor || 0x0a0a0a); alpha = 1; }
     if (sh.mat !== undefined && materials.has(sh.mat)) alpha = opacity.get(sh.mat) ?? 1;
     const last = instances[instances.length - 1], grp = groupOf(ck);
     if (last && last.M === M && last.group === grp && last.parts[0].color === col && (last.parts[0].opacity ?? 1) === alpha) last.parts[0].shells.push(sh);

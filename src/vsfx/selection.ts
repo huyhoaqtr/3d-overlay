@@ -8,6 +8,10 @@ import type { SceneModel } from './buildScene';
 import type { Vec3 } from './types';
 
 const COLOR = 0xff9800;
+/** ngưỡng thô (mét, world) khi dò đường gấp khúc; lọc tinh lại theo pixel */
+const WIRE_THRESHOLD = 0.5;
+/** dung sai chọn đường gấp khúc (pixel) */
+const WIRE_PICK_PX = 6;
 
 export interface SelectionInfo {
   /** chỉ số nội bộ (dùng cho chọn/ẩn và hỏi worker), không phải dữ liệu file */
@@ -16,6 +20,8 @@ export interface SelectionInfo {
   handle: string;
   name: string;
   triangles: number;
+  /** số đoạn thẳng của đường gấp khúc (kiểu 05) thuộc đối tượng; 0 nếu không có */
+  lines: number;
   /** bbox (dài, rộng, cao) theo MÉT, trục file (Z lên) */
   size: Vec3;
   /** tên file chứa đối tượng (overlay nhiều file); Viewer điền */
@@ -50,15 +56,39 @@ export class SelectionController {
    *  file_2.vsfx, để còn chọn được vật phía sau). Viewer gọi cho mọi model rồi chọn cái gần nhất (overlay). */
   hitTest(raycaster: THREE.Raycaster): { id: number; distance: number } | null {
     this.model.ensureBvh();
-    const pickable = this.model.batches.filter(b => !(b.kind === 'glass' && b.opacity === 0)).map(b => b.mesh);
+    let best: { id: number; distance: number } | null = null;
+    const pickable = this.model.batches.filter(b => b.kind !== 'wire' && !(b.kind === 'glass' && b.opacity === 0)).map(b => b.mesh);
     for (const h of raycaster.intersectObjects(pickable, false)) {
       const batch = this.model.batches.find(b => b.mesh === h.object);
       if (!batch || h.faceIndex == null) continue;
       const id = this.model.entityAt(batch, h.faceIndex);
       if (id == null || this.model.isHidden(id)) continue;
-      return { id, distance: h.distance };
+      best = { id, distance: h.distance };
+      break;
     }
-    return null;
+    // Đường gấp khúc (kiểu 05) mỏng nên bắt bằng dung sai theo PIXEL: Three chỉ nhận ngưỡng theo đơn vị world, nên lấy ngưỡng
+    // rộng rồi lọc lại theo khoảng cách từ điểm trúng tới tia so với kích thước 1 pixel tại khoảng cách đó.
+    const cam = (raycaster as THREE.Raycaster & { camera?: THREE.Camera }).camera as THREE.PerspectiveCamera | undefined;
+    const wires = this.model.batches.filter(b => b.kind === 'wire');
+    if (wires.length && cam?.isPerspectiveCamera) {
+      const prev = raycaster.params.Line.threshold;
+      // ngưỡng Three tính theo toạ độ LOCAL của đường (model có thể nhân tỉ lệ đơn vị -> mm/feet/m), nên chia cho tỉ lệ world
+      const sc = new THREE.Vector3().setFromMatrixScale(wires[0].lines.matrixWorld);
+      raycaster.params.Line.threshold = WIRE_THRESHOLD / (((sc.x + sc.y + sc.z) / 3) || 1);
+      const perPx = (2 * Math.tan(THREE.MathUtils.degToRad(cam.fov) / 2)) / Math.max(1, this.resolution.y);
+      for (const h of raycaster.intersectObjects(wires.map(b => b.lines), false)) {
+        if (best && h.distance >= best.distance) break;
+        const batch = wires.find(b => b.lines === h.object);
+        if (!batch || h.index == null) continue;
+        if (raycaster.ray.distanceToPoint(h.point) > WIRE_PICK_PX * perPx * h.distance) continue;
+        const id = this.model.entityAtEdge(batch, h.index);
+        if (id == null || this.model.isHidden(id)) continue;
+        best = { id, distance: h.distance };
+        break;
+      }
+      raycaster.params.Line.threshold = prev;
+    }
+    return best;
   }
 
   select(id: number | null) {
@@ -95,8 +125,15 @@ export class SelectionController {
 
   private info(id: number): SelectionInfo {
     const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
-    let tris = 0;
+    let tris = 0, segs = 0;
     for (const { batch, range } of this.model.parts.get(id) ?? []) {
+      if (batch.kind === 'wire') {   // đường gấp khúc: bbox theo đoạn thẳng
+        const e = batch.edgePositions, eEnd = (range.eStart + range.eCount) * 3;
+        segs += range.eCount / 2;
+        for (let i = range.eStart * 3; i < eEnd; i += 3)
+          for (let d = 0; d < 3; d++) { const x = e[i + d]; if (x < mn[d]) mn[d] = x; if (x > mx[d]) mx[d] = x; }
+        continue;
+      }
       const p = batch.positions, end = (range.vStart + range.vCount) * 3;
       tris += range.vCount / 3;
       for (let i = range.vStart * 3; i < end; i += 3)
@@ -108,7 +145,8 @@ export class SelectionController {
       handle: this.model.entityHandles[id] ?? `#${id}`,
       name: raw.replace(/^Od\w+?::/, '') || `Entity #${id}`,
       triangles: tris,
-      size: tris ? [0, 1, 2].map(d => (mx[d] - mn[d]) * this.unitScale) as Vec3 : [0, 0, 0],
+      lines: segs,
+      size: tris || segs ? [0, 1, 2].map(d => (mx[d] - mn[d]) * this.unitScale) as Vec3 : [0, 0, 0],
     };
   }
 
@@ -152,7 +190,7 @@ export class SelectionController {
       lg.setPositions(edge);
       // depthTest bật: cạnh bị che (vd mặt đáy khối đường chôn dưới địa hình) không vẽ xuyên lên trên.
       // Không z-fight với mặt vì vật liệu đặc đã có polygonOffset đẩy ra sau.
-      const mat = new LineMaterial({ color: COLOR, linewidth: 1, worldUnits: false, depthTest: true, transparent: true });
+      const mat = new LineMaterial({ color: COLOR, linewidth: vN ? 1 : 3, worldUnits: false, depthTest: true, transparent: true });
       mat.resolution.copy(this.resolution);
       const line = new LineSegments2(lg, mat);
       line.raycast = () => {};

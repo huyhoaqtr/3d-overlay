@@ -18,6 +18,8 @@ export interface Shell {
   color?: number;
   /** handle vật liệu ghi ngay trong header shell (cùng biến thể trên) */
   mat?: number;
+  /** true = đường gấp khúc (hình học kiểu 05: ống/đường Revit), không có face; verts là các điểm nối tiếp */
+  line?: boolean;
   /** cache tam giác (chỉ số đỉnh), tạo khi dựng scene */
   tri?: number[];
   /** chỉ số face của từng tam giác (song song với tri / 3) */
@@ -84,6 +86,8 @@ export interface ModelSummary {
   shellCount: number;
   /** số shell được vẽ (shell của định nghĩa INSERT được tính theo số lần dùng) */
   meshCount: number;
+  /** số đường gấp khúc (kiểu 05) vẽ được; 0 nếu file không có */
+  lineCount: number;
   instanceCount: number;
   records: number;
   transforms: number;
@@ -92,7 +96,7 @@ export interface ModelSummary {
   unitMM: number;
 }
 
-export type ChunkKind = 'opaque' | 'glass' | 'faceCol';
+export type ChunkKind = 'opaque' | 'glass' | 'faceCol' | 'wire';
 
 /** Một khối lưới đã gộp, sẵn sàng tạo BufferGeometry (toạ độ world, Z lên). */
 export interface MeshChunk {

@@ -112,10 +112,18 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
     const id = idOf[ii];
     ins.parts.forEach(part => {
       const color = debugColors ? new THREE.Color().setHSL((ii * 0.618) % 1, .55, .6).getHex() : (part.color || 0xb0b0b0);
-      const buckets: Record<ChunkKind, number[]> = { opaque: [], glass: [], faceCol: [] };
+      const buckets: Record<ChunkKind, number[]> = { opaque: [], glass: [], faceCol: [], wire: [] };
       const fcol: number[] = [];
       const alpha = part.opacity ?? -1;     // ≥ 0: vật liệu trong file có độ đục < 1 (kính, khối trong suốt)
       for (const sh of part.shells) {
+        if (sh.line) {   // đường gấp khúc: các đoạn nối tiếp giữa điểm k và k+1, áp ma trận instance
+          const w = buckets.wire, vv = sh.verts;
+          for (let k = 0; k + 5 < vv.length; k += 3) {
+            v.set(vv[k], vv[k + 1], vv[k + 2]).applyMatrix4(ins.M); w.push(v.x, v.y, v.z);
+            v.set(vv[k + 3], vv[k + 4], vv[k + 5]).applyMatrix4(ins.M); w.push(v.x, v.y, v.z);
+          }
+          continue;
+        }
         const glass = glassOn && !debugColors && (alpha >= 0 || isGlass(part.color, sh, unitMM));
         const faceColors = debugColors ? null : sh.faceColors;
         const tri = triangulateShell(sh), out = buckets[faceColors ? 'faceCol' : glass ? 'glass' : 'opaque'];
@@ -130,9 +138,18 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
           }
         });
       }
-      for (const kind of ['opaque', 'glass', 'faceCol'] as const) {
+      for (const kind of ['opaque', 'glass', 'faceCol', 'wire'] as const) {
         const arr = buckets[kind];
         if (!arr.length) continue;
+        if (kind === 'wire') {   // chỉ có đoạn thẳng, không có mặt: vCount = 0
+          const key = `wire:${color}`, seg = new Float32Array(arr);
+          let acc = accs.get(key);
+          if (!acc) accs.set(key, acc = { kind, color, opacity: -1, pos: [], nor: [], col: [], edg: [], ranges: [], vCount: 0, eCount: 0 });
+          acc.ranges.push(id, acc.vCount, 0, acc.eCount, seg.length / 3);
+          acc.edg.push(seg);
+          acc.eCount += seg.length / 3;
+          continue;
+        }
         const g = new THREE.BufferGeometry();
         const positions = new Float32Array(arr);
         g.setAttribute('position', new THREE.BufferAttribute(positions, 3));

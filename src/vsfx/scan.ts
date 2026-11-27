@@ -106,6 +106,36 @@ export function scanShells(raw: Uint8Array): Shell[] {
   return shells;
 }
 
+/* Đường gấp khúc (hình học kiểu 05 — file Revit: đường ống/ống luồn dây, đường mô hình…): cùng header với shell nhưng byte
+ * kiểu = 05 thay vì 08:  05 00 00 00 00 0C 00 [cờ] [cờ2] 00 | u32 cnt | cnt × (x,y,z f64), KHÔNG có face list (hết là sang bản ghi
+ * kế). Màu nằm trong bản ghi `0D 04|06 00 00 [f1 f2] 00 [B G R] C2` ngay trước (file_5.vsfx: 1 759 đường 2 điểm, xanh/cam/olive
+ * như viewer gốc). Chỉ nhận khi có bản ghi màu đó phía trước, để khỏi nhầm với byte 05 ngẫu nhiên. Suy luận, chưa có spec. */
+export function scanLines(raw: Uint8Array): Shell[] {
+  const L = raw.length, { f64, u32 } = views(raw), lines: Shell[] = [];
+  for (let o = 0; o + 14 <= L; o++) {
+    if (raw[o] !== 5 || raw[o + 1] || raw[o + 2] || raw[o + 3] || raw[o + 4]) continue;
+    const h = o + 5;
+    if (raw[h] !== 0x0c || raw[h + 1] || raw[h + 3] > 1 || raw[h + 4]) continue;
+    const cnt = u32(h + 5), s = h + 9;
+    if (cnt < 2 || cnt > 100000 || s + cnt * 24 > L) continue;
+    let hasColor = false;
+    for (let q = h - 1; q >= Math.max(0, h - 60) && !hasColor; q--)
+      hasColor = raw[q] === 0x0d && (raw[q + 1] === 4 || raw[q + 1] === 6) && !raw[q + 2] && !raw[q + 3] && !raw[q + 6] && (raw[q + 10] === 0xc2 || raw[q + 10] === 0xc0);   // C0 = ByLayer (không màu riêng)
+    if (!hasColor) continue;
+    const v = new Float64Array(cnt * 3);
+    let ok = true;
+    for (let i = 0; i < cnt * 3; i++) {
+      const x = f64(s + i * 8);
+      if (!Number.isFinite(x) || Math.abs(x) > 1e7) { ok = false; break; }
+      v[i] = x;
+    }
+    if (!ok) continue;
+    lines.push({ off: s, end: s + cnt * 24, verts: v, faces: new Int32Array(0), faceColors: null, line: true });
+    o = s + cnt * 24 - 1;
+  }
+  return lines;
+}
+
 /* Ma trận trực giao: 3 double tịnh tiến + 9 double xoay (lưu theo hàng); world = Mᵀ·v + t.
  * Gọi onMatrix(offset, Matrix4) cho mỗi bản ghi tìm thấy. */
 export function scanTransforms(raw: Uint8Array, start: number, onMatrix: (off: number, M: THREE.Matrix4) => void): void {

@@ -44,7 +44,7 @@ function ModelInfo({ layer }: { layer: LayerView }) {
     <dl className="info">
       <dt>File</dt><dd>{layer.name}</dd>
       <dt>Định dạng</dt><dd>{s.format}</dd>
-      <dt>Hình học</dt><dd>{s.shellCount} shell → {s.meshCount} mesh, {s.instanceCount} entity/instance</dd>
+      <dt>Hình học</dt><dd>{s.shellCount} shell → {s.meshCount} mesh{s.lineCount > 0 && `, ${s.lineCount} đường`}, {s.instanceCount} entity/instance</dd>
       <dt>Cấu trúc</dt><dd>{s.records} node/bản ghi, {s.transforms} transform, {s.inserts} block INSERT</dd>
       {s.skipped > 0 && <><dt>Ẩn</dt><dd>{s.skipped} shell trong block không được tham chiếu</dd></>}
       {layer.size && (
@@ -101,7 +101,7 @@ function SelectionPanel({ selection, hasHidden, viewer, multi }: {
             {multi && selection.file && <><dt>File</dt><dd>{selection.file}</dd></>}
             <dt>Tên</dt><dd>{selection.name}</dd>
             <dt>Handle</dt><dd>{selection.handle}</dd>
-            <dt>Tam giác</dt><dd>{selection.triangles.toLocaleString()}</dd>
+            <dt>Tam giác</dt><dd>{selection.triangles.toLocaleString()}{selection.lines > 0 && ` · ${selection.lines.toLocaleString()} đoạn thẳng`}</dd>
             <dt>Kích thước</dt><dd>{fmtSize(selection.size, 2)}</dd>
           </dl>
           <div className="actions">
