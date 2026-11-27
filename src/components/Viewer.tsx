@@ -1,6 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { SceneModel, SelectionController } from '../vsfx';
 import type { MeshData, SelectionInfo, Vec3 } from '../vsfx';
 
@@ -29,6 +30,8 @@ interface Props {
   highlightKey: number | null;
   edges: boolean;
   light: boolean;
+  /** độ tương phản hình (1 = mặc định) */
+  contrast: number;
   /** kích thước (m) của từng layer, theo trục file (dài, rộng, cao) */
   onLayerSize?: (key: number, size: Vec3) => void;
   onSelect?: (info: SelectionInfo | null) => void;
@@ -67,7 +70,7 @@ const CLICK_SLOP_PX = 5;
  * tất cả quy về mét trong một gốc chung để chồng lên nhau. Chọn xuyên mọi layer (giao điểm gần nhất). Chỉ render khi
  * có thay đổi (camera, kích thước, tùy chọn, chọn/ẩn) nên lúc đứng yên GPU nghỉ. */
 const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
-  { layers, highlightKey, edges, light, onLayerSize, onSelect, onHiddenChange }, ref,
+  { layers, highlightKey, edges, light, contrast, onLayerSize, onSelect, onHiddenChange }, ref,
 ) {
   const mountRef = useRef<HTMLDivElement>(null);
   const ctx = useRef<ViewerContext | null>(null);
@@ -109,10 +112,19 @@ const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
     const camera = new THREE.PerspectiveCamera(40, 1, 0.05, 1e6);
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8f99, 1.6));
-    const sun = new THREE.DirectionalLight(0xffffff, 1.4);
-    sun.position.set(-1, 3, 2);
-    scene.add(sun);
+    // Phối sáng: môi trường studio (IBL) cho độ chuyển sắc mềm + đèn chính ấm từ một phía (tạo tương phản mặt sáng/tối)
+    // + đèn phụ lạnh phía đối diện (giữ mặt khuất không bị bẩn/xám) + bán cầu nhẹ.
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    const envTex = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+    scene.environment = envTex;
+    // Theo three-gltf-viewer: RoomEnvironment + đèn môi trường + đèn định hướng gắn vào camera (~60°), nên mặt đang nhìn
+    // luôn được chiếu sáng, không phụ thuộc hướng xoay model. Cường độ hạ so với mặc định của họ (0.3 / 0.8π):
+    // vật liệu IFC/Revit vốn nhạt, giữ nguyên thì trắng bị cháy (đã so bằng mắt trên file_4).
+    scene.add(camera);
+    const ambient = new THREE.AmbientLight(0xffffff, 0.3);
+    const main = new THREE.DirectionalLight(0xffffff, 1.2);
+    main.position.set(0.5, 0, 0.866);
+    camera.add(ambient, main);
     const world = new THREE.Group();
     world.rotation.x = -Math.PI / 2;            // file dùng Z lên -> Three dùng Y lên
     scene.add(world);
@@ -189,6 +201,7 @@ const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
       dom.removeEventListener('pointerup', onUp);
       controls.removeEventListener('change', invalidate);
       controls.dispose();
+      envTex.dispose(); pmrem.dispose();
       for (const l of c.layers.values()) { l.selection.dispose(); l.model.dispose(); }
       renderer.dispose();
       el.removeChild(dom);
@@ -211,6 +224,13 @@ const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
     showAll: () => { const c = ctx.current; if (c) for (const l of c.layers.values()) l.selection.showAll(); },
     clearSelection: () => selectIn(null, null),
   };
+
+  // --- tương phản (bộ lọc trên canvas: áp lên cả cạnh/kính, không cần dựng lại cảnh)
+  useEffect(() => {
+    const c = ctx.current;
+    if (!c) return;
+    c.renderer.domElement.style.filter = contrast === 1 ? '' : `contrast(${contrast})`;
+  }, [contrast]);
 
   // --- nền
   useEffect(() => {

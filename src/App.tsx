@@ -40,7 +40,7 @@ export default function App() {
   const [source, setSource] = useState<string | null>(SAMPLES[0]);   // file mẫu đang làm nền; null = file tự chọn
   const [layers, setLayers] = useState<Layer[]>([]);
   const [highlightKey, setHighlightKey] = useState<number | null>(null);
-  const [options, setOptions] = useState<ViewOptions>({ edges: true, light: true, glass: true, debugColors: false });
+  const [options, setOptions] = useState<ViewOptions>({ edges: true, light: true, glass: true, debugColors: false, contrast: 1.15 });
   const [selection, setSelection] = useState<SelectionInfo | null>(null);
   const [hasHidden, setHasHidden] = useState(false);
   const [dragging, setDragging] = useState(false);
@@ -183,6 +183,7 @@ export default function App() {
         highlightKey={highlightKey}
         edges={options.edges}
         light={options.light}
+        contrast={options.contrast}
         onLayerSize={onLayerSize}
         onSelect={setSelection}
         onHiddenChange={setHasHidden}

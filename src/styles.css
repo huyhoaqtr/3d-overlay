@@ -39,6 +39,37 @@ body,
   background: var(--panel-bg);
 }
 
+.panel-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin: 0 0 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: #fff;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.panel.collapsed {
+  padding: 8px 12px;
+}
+
+.panel.collapsed .panel-toggle {
+  margin: 0;
+}
+
+.panel .chev {
+  display: inline-block;
+  width: 1em;
+  color: var(--muted);
+}
+
 .panel h1 {
   margin: 0 0 6px;
   font-size: 14px;

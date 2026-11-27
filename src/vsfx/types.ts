@@ -132,6 +132,8 @@ export interface ViewOptions {
   light: boolean;
   glass: boolean;
   debugColors: boolean;
+  /** độ tương phản hình (1 = mặc định) */
+  contrast: number;
 }
 
 export interface SceneInfo {

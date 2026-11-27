@@ -248,6 +248,15 @@ function resolveBlockMatrices(ext: Extent[], instances: Instance[], blocks: numb
       const a = worldBox(parents), b = worldBox([ins], M);
       return has([0, 1, 2, 3, 4, 5].map(d => (d < 3 ? Math.min(a[d], b[d]) : Math.max(a[d], b[d])))).size > 0;
     };
-    if (!fits() && fits(ident)) ins.M = ident;
+    if (!fits() && fits(ident)) {
+      // Bảng extents còn chứa bbox LOCAL của định nghĩa block (mini_house.vsfx: cánh cửa 0..1835 × 176..320 trùng mục 135) —
+      // "khớp bảng khi bỏ ma trận" có thể chỉ là khớp bbox định nghĩa. Thân block thật sự đã ở toạ độ world thì nằm sát
+      // phần còn lại của đối tượng (tay nắm, khung…) ở world; nếu bỏ ma trận mà thân văng xa khỏi đối tượng, còn áp ma trận cha
+      // thì chạm vào đối tượng -> giữ ma trận cha (cửa lớn bị mất vì thân cửa nằm ở gốc toạ độ).
+      const pb = parents.length ? worldBox(parents) : null, tol = 300 / unitMM;
+      const gap = (a: number[], b: number[]) => Math.max(0, ...[0, 1, 2].map(d => Math.max(a[d] - b[d + 3], b[d] - a[d + 3])));
+      const farWithout = pb && gap(worldBox([ins], ident), pb) > tol && gap(worldBox([ins]), pb) <= tol;
+      if (!farWithout) ins.M = ident;
+    }
   }
 }

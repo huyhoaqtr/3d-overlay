@@ -133,14 +133,18 @@ function scanMaterialUse(raw: Uint8Array, materials: Map<number, number>, opacit
  *     Bit 0x40 của f1 KHÔNG có nghĩa "kế thừa" khi có màu — từng bỏ sót các màu này;
  *   - `unset`: không có bản ghi, hoặc f1 = f2 = 00 + màu 000000 -> dùng màu nền nếu đối tượng có (mặt ngoài tường 34);
  *   - `other`: còn lại, vd 81/00 (màu riêng của mặt: mặt trong trắng, mặt cắt lõi xám) — giữ logic cũ.
- *     Các cờ khác (vd 8B/03 ở school) chưa áp vì có dấu hiệu lệch giữa các phần. */
-type GeometryColor = { k: 'material' } | { k: 'base'; c: number } | { k: 'unset' } | { k: 'other' };
+ *   - `own`: 8B/03 + màu (school.vsfx: cửa) -> màu RIÊNG của đúng shell mang bản ghi (cánh cửa be e6c19e, khung nâu 994c2b;
+ *     trước đây cánh cửa bị đổ màu khung vì bỏ qua bản ghi này, xác nhận bằng ảnh chuẩn của người dùng). KHÔNG dính sang
+ *     các shell sau (thử dính như CB/07: đổi 12 289 shell, kể cả 6 744 shell kính -> sai) và bỏ qua với vật liệu trong suốt
+ *     (kính mang màu giữ chỗ 0080C0, giữ màu theo vật liệu như trước). */
+type GeometryColor = { k: 'material' } | { k: 'base'; c: number } | { k: 'own'; c: number } | { k: 'unset' } | { k: 'other' };
 function geometryColor(raw: Uint8Array, h: number): GeometryColor {
   for (let q = h - 1; q >= Math.max(0, h - 48); q--) {
     if (raw[q] !== 0x0d || (raw[q + 1] !== 4 && raw[q + 1] !== 6) || raw[q + 2] || raw[q + 3] || raw[q + 6]) continue;
     const c = (raw[q + 9] << 16) | (raw[q + 8] << 8) | raw[q + 7], f1 = raw[q + 4], f2 = raw[q + 5];
     if (f2 === 2 && !c) return { k: 'material' };
     if (f1 === 0xcb && f2 === 7 && raw[q + 10] === 0xc2 && c) return { k: 'base', c };
+    if (f1 === 0x8b && f2 === 3 && raw[q + 10] === 0xc2 && c) return { k: 'own', c };
     if (!f1 && !f2 && !c) return { k: 'unset' };
     return { k: 'other' };
   }
@@ -268,14 +272,14 @@ export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
   const instances: Instance[] = [], ident = new THREE.Matrix4(), mCache = new Map<string, THREE.Matrix4>();
   const groupIds = new Map<string, number>();
   const groupOf = (k: string) => { let g = groupIds.get(k); if (g === undefined) groupIds.set(k, g = groupIds.size); return g; };
-  let ci = -1, curColor = 0, lastScope = -2, baseColor = 0;   // baseColor: màu nền đối tượng (bản ghi CB/07), theo phạm vi
+  let ci = -1, curColor = 0, lastScope = -2, baseColor = 0, ownColor = 0, glassColor = 0;   // baseColor: màu nền đối tượng (bản ghi CB/07), theo phạm vi
   for (const sh of shells) {
     const sc = scopeOf(sh.off);
     while (ci + 1 < colors.length && colors[ci + 1].o < sh.off) {
       ci++;
       if (scopeOf(colors[ci].o) === sc) curColor = colors[ci].c;
     }
-    if (sc !== lastScope) { lastScope = sc; baseColor = 0; if (ci < 0 || scopeOf(colors[ci].o) !== sc) curColor = 0; }
+    if (sc !== lastScope) { lastScope = sc; baseColor = 0; ownColor = 0; glassColor = 0; if (ci < 0 || scopeOf(colors[ci].o) !== sc) curColor = 0; }
     const ri = recAt(sh.off), g = ri >= 0 ? recs[ri].h : null;
     let list = g != null ? (holders.get(sc) ?? []).filter(x => x.H <= g && g < x.E).sort((a, b) => a.H - b.H) : [];
     // Holder không tìm được điểm kết thúc (E = ∞: cây con không dò ra anh em kế tiếp) là các nhánh ANH EM nhau
@@ -309,10 +313,18 @@ export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
     // cây / bụi / người (revit.vsfx: đúng 10 shell; school.vsfx: các cây) — từng làm 1 cây be, 1 cây vàng trong khi
     // ảnh chuẩn đều xám. Shell thường có f2 = 03 kèm màu thật. (Suy luận từ 2 file, chưa có spec.)
     const gc = geometryColor(raw, sh.off - 9);
-    if (gc.k === 'base') baseColor = gc.c;
+    if (gc.k === 'base') { baseColor = gc.c; ownColor = 0; }
+    if (gc.k === 'own') { ownColor = gc.c; baseColor = 0; }
     let col = gc.k === 'material' ? 0 : gc.k === 'base' ? gc.c : gc.k === 'unset' && baseColor ? baseColor : curColor, alpha = 1;
     const mi = lastLE(matUse, sh.off, x => x.o), mat = mi >= 0 && scopeOf(matUse[mi].o) === sc ? matUse[mi] : null;
-    if (mat) { if (!col) col = mat.c; alpha = mat.a; }
+    const glassMat = !!mat && mat.a < 1;
+    const hadCol = col !== 0;
+    if (mat) { if (!col) col = glassMat && glassColor ? glassColor : mat.c; alpha = mat.a; }
+    // 8B/03: màu riêng của shell. Với kính (vật liệu trong suốt) chỉ áp khi shell chưa có màu nào khác (màu rơi về vật liệu
+    // xám 828d89), và màu đó dính sang các shell kính sau cùng phạm vi — kính school.vsfx là 0080C0 như các file khác.
+    if (glassMat) { if (gc.k === 'own' && !hadCol) { col = gc.c; glassColor = gc.c; } }
+    else if (gc.k === 'own') col = gc.c;
+    else if (gc.k === 'unset' && ownColor) col = ownColor;
     // Shell có màu / vật liệu ghi ngay trong header của nó: ưu tiên hơn màu entity (giống màu theo face)
     if (sh.color) col = sh.color;
     if (sh.mat !== undefined && materials.has(sh.mat)) alpha = opacity.get(sh.mat) ?? 1;
@@ -333,8 +345,58 @@ export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
       });
     }   // cùng scope + cùng chuỗi ma trận = một đối tượng (vd ghế = mặt ghế + chân khác màu)
   }
+  removeTextPlates(instances);
   return {
-    format: 'OdTv (Revit)', shells, instances, records: recs.length, transforms: nxf,
+    format: 'OdTv (Revit)', shells, instances: instances.filter(i => i.parts.some(p => p.shells.length)), records: recs.length, transforms: nxf,
     inserts: 0, skipped: 0, unitMM: detectUnitMM(raw) ?? 304.8, materials,
   };
+}
+
+/* Chữ Revit (family "Model Text : …") được xuất kèm một "tấm nền" hộp ngay sau chữ: đúng 5 shell 4 đỉnh (3 mặt ngang + 2 mặt
+ * đứng) phủ kín bbox của cả dòng chữ — vẽ ra thành nền trắng đục đằng sau chữ (file_1.vsfx: cả 7 đối tượng chữ đều có đúng 5
+ * shell này, vd 2184042 "Snowdon Towers"). Người dùng chỉ muốn thấy chữ -> bỏ các shell đó. Nhận diện: shell ≤ 8 đỉnh có chiều
+ * dài (theo trục dài nhất của cả đối tượng) ≥ 90% chiều dài đối tượng; đối tượng phải có ≥ 20 shell để một chữ cái đơn lẻ
+ * (vd dấu gạch "—", chữ "l") không bị xoá nhầm. Suy luận từ 7 đối tượng của file_1, chưa có spec. */
+function removeTextPlates(instances: Instance[]) {
+  const byHandle = new Map<string, Instance[]>();
+  for (const ins of instances) {
+    if (!ins.name.startsWith('Model Text') || !ins.handle) continue;
+    const l = byHandle.get(ins.handle);
+    if (l) l.push(ins); else byHandle.set(ins.handle, [ins]);
+  }
+  for (const list of byHandle.values()) {
+    const items: { shell: Shell; b: number[] }[] = [];
+    const B = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
+    for (const ins of list) {
+      const e = ins.M.elements;
+      for (const p of ins.parts) for (const sh of p.shells) {
+        const b = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity], v = sh.verts;
+        for (let k = 0; k + 2 < v.length; k += 3)
+          for (let d = 0; d < 3; d++) {
+            const w = e[d] * v[k] + e[d + 4] * v[k + 1] + e[d + 8] * v[k + 2] + e[d + 12];
+            if (w < b[d]) b[d] = w;
+            if (w > b[d + 3]) b[d + 3] = w;
+          }
+        items.push({ shell: sh, b });
+        for (let d = 0; d < 3; d++) { if (b[d] < B[d]) B[d] = b[d]; if (b[d + 3] > B[d + 3]) B[d + 3] = b[d + 3]; }
+      }
+    }
+    if (items.length < 20) continue;
+    const ext = [0, 1, 2].map(d => B[d + 3] - B[d]);
+    const D = ext.indexOf(Math.max(...ext));
+    const plate = new Set<Shell>();
+    for (const it of items)
+      if (it.shell.verts.length <= 24 && it.b[D + 3] - it.b[D] >= 0.9 * ext[D]) plate.add(it.shell);
+    if (!plate.size) continue;
+    // Hộp gồm 8 shell liền nhau ở ĐUÔI danh sách shell của đối tượng (sau chữ cái cuối), theo thứ tự: mặt đầu trái, ngang,
+    // đầu phải, ngang, ngang, mặt giữa, 2 mặt rộng — 5 cái dài đã bắt ở trên, 3 mặt đứng còn lại (trái, giữa, phải) không dài
+    // nên không bắt được bằng chiều dài (từng để sót 3 vạch cam khi chọn). Cả 7 đối tượng của file_1 đều đúng 8 shell cuối;
+    // chỉ lấy khi 8 shell cuối đều nhỏ (≤ 8 đỉnh) và chứa đủ các shell dài, để mặt bên của chữ không bị ăn nhầm.
+    items.sort((a, b) => a.shell.off - b.shell.off);
+    const tail = items.slice(-8);
+    if (tail.length === 8 && tail.every(it => it.shell.verts.length <= 24) && [...plate].every(sh => tail.some(it => it.shell === sh)))
+      for (const it of tail) plate.add(it.shell);
+    for (const ins of list) for (const p of ins.parts) p.shells = p.shells.filter(sh => !plate.has(sh));
+    for (const ins of list) ins.parts = ins.parts.filter(p => p.shells.length);
+  }
 }

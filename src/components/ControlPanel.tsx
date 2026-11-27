@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import type { RefObject } from 'react';
 import { unitLabel } from '../vsfx';
 import type { LoadStage, ModelSummary, SelectionInfo, Vec3, ViewOptions } from '../vsfx';
@@ -27,7 +28,7 @@ const STAGE_LABEL: Record<LoadStage, string> = {
   mesh: 'dựng lưới',
 };
 
-const TOGGLES: [keyof ViewOptions, string][] = [
+const TOGGLES: [Exclude<keyof ViewOptions, 'contrast'>, string][] = [
   ['edges', 'Hiện cạnh'],
   ['light', 'Nền sáng'],
   ['glass', 'Kính trong suốt'],
@@ -139,12 +140,16 @@ export default function ControlPanel({
   samples, source, onSourceChange, onFile, onAddSample, onAddFile, layers, highlightKey, onHighlight, onToggleVisible,
   onRemove, options, onOptionsChange, selection, hasHidden, viewer,
 }: Props) {
+  const [open, setOpen] = useState(false);   // mặc định thu gọn
   const anyReady = layers.some(l => l.status.state === 'ready');
   // thông tin chi tiết: file đang tô sáng, không thì file đầu tiên
   const detail = layers.find(l => l.key === highlightKey) ?? layers[0];
   return (
-    <aside className="panel">
-      <h1>VSFX viewer</h1>
+    <aside className={open ? 'panel' : 'panel collapsed'}>
+      <button type="button" className="panel-toggle" aria-expanded={open} onClick={() => setOpen(o => !o)}>
+        <span className="chev">{open ? '▾' : '▸'}</span> VSFX viewer
+      </button>
+      {open && <>
 
       <label className="row">
         File mẫu:{' '}
@@ -184,9 +189,19 @@ export default function ControlPanel({
             {label}
           </label>
         ))}
+        <label className="row">
+          Tương phản: {options.contrast.toFixed(2)}{' '}
+          <input
+            type="range" min={0.6} max={1.8} step={0.05} value={options.contrast}
+            onChange={e => onOptionsChange({ ...options, contrast: Number(e.target.value) })}
+            onDoubleClick={() => onOptionsChange({ ...options, contrast: 1 })}
+            title="Nhấp đúp để về mặc định"
+          />
+        </label>
       </fieldset>
       {anyReady && <SelectionPanel selection={selection} hasHidden={hasHidden} viewer={viewer} multi={layers.length > 1} />}
       <p className="hint">Kéo thả file .vsfx vào cửa sổ để mở (giữ Shift để chồng thêm). Phân tích file chạy trong Web Worker.</p>
+      </>}
     </aside>
   );
 }
