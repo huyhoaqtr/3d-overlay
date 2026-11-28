@@ -16,7 +16,7 @@ import { views, scanTransforms, lastLE, identity } from './scan';
 import { detectUnitMM } from './units';
 import type { Instance, SheetView, Shell, VsfxModel } from './types';
 
-interface TvRecord {
+export interface TvRecord {
   o: number;
   end: number;
   h: number | null;
@@ -29,7 +29,7 @@ interface Holder {
   M: THREE.Matrix4;
 }
 
-function scanRecords(raw: Uint8Array): TvRecord[] {
+export function scanRecords(raw: Uint8Array): TvRecord[] {
   const L = raw.length, { u32 } = views(raw);
   const isPfx = (q: number) => raw[q] === 0x0c && raw[q + 1] === 0x02 && !raw[q + 2] && !raw[q + 3] && !raw[q + 4];
   // Bản ghi mở đầu bằng 50 00 11 (mọi file Revit mẫu). File BẢN VẼ (sheet3.vsfx: 8 546 bản ghi 40 00 11, chỉ 32 cái 50 00 11 là
@@ -83,7 +83,7 @@ function scanRecords(raw: Uint8Array): TvRecord[] {
 
 /* Vật liệu: từ điển "GeneratedMaterial__N" + u64 handle; bản ghi vật liệu: tên, 00 00,
  * 01 [double] [B G R] C2 (ambient), 01 [double] [B G R] C2 (diffuse). Trả Map handle -> diffuse. */
-function scanMaterials(raw: Uint8Array, opacityOut?: Map<number, number>): Map<number, number> {
+export function scanMaterials(raw: Uint8Array, opacityOut?: Map<number, number>): Map<number, number> {
   const L = raw.length, { u32 } = views(raw);
   const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
   const nameOpacity = new Map<string, number>();
@@ -122,7 +122,7 @@ function scanMaterials(raw: Uint8Array, opacityOut?: Map<number, number>): Map<n
 
 /* Header hình học `18 00 1D`: 8 byte trước nó là handle vật liệu. Trả danh sách { o, c } (c = màu diffuse của
  * vật liệu đó), sắp theo offset; dùng làm màu cho shell không có màu entity (màu 0). */
-function scanMaterialUse(raw: Uint8Array, materials: Map<number, number>, opacity: Map<number, number>): { o: number; c: number; a: number }[] {
+export function scanMaterialUse(raw: Uint8Array, materials: Map<number, number>, opacity: Map<number, number>): { o: number; c: number; a: number }[] {
   const out: { o: number; c: number; a: number }[] = [], { u32 } = views(raw);
   for (let q = 8; q + 3 <= raw.length; q++) {
     if (raw[q] !== 0x18 || raw[q + 1] !== 0 || raw[q + 2] !== 0x1d) continue;
@@ -169,7 +169,7 @@ function lineColor(raw: Uint8Array, h: number): number {
   return -1;
 }
 
-function scanColors(raw: Uint8Array): { o: number; c: number }[] {
+export function scanColors(raw: Uint8Array): { o: number; c: number }[] {
   const L = raw.length, colors: { o: number; c: number }[] = [];
   for (let q = 17; q + 12 <= L; q++) {
     if (raw[q] === 0x0d && raw[q + 1] === 0x04 && !raw[q + 2] && !raw[q + 3] && !raw[q + 6] && raw[q + 10] === 0xc2) {
@@ -192,7 +192,7 @@ const hexHandle = (h: number | undefined) => (h == null ? undefined : '0x' + h.t
  * `0C 02 00 00 00 [u32 handle CSDL]`. Cùng cấu trúc với node IFC (handle nguồn ở sau `08 00 00 00`). Có cho cả
  * system family (tường, mái…: bản ghi mở đầu 50 00 11 00 00 01 01) lẫn family instance (ghế, cửa, cây: nằm trong
  * bản ghi C). Xác nhận bằng viewer gốc: mái revit.vsfx = 243274 (handle CSDL 0x18c). Trả danh sách sắp theo handle CSDL. */
-function scanElements(raw: Uint8Array): { db: number; id: number }[] {
+export function scanElements(raw: Uint8Array): { db: number; id: number }[] {
   const { u32 } = views(raw), out: { db: number; id: number }[] = [];
   const SIG = [1, 1, 0, 0, 0, 0x73, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0];
   outer: for (let o = 0; o + 80 <= raw.length; o++) {
@@ -208,7 +208,7 @@ function scanElements(raw: Uint8Array): { db: number; id: number }[] {
 
 /* Tên phần tử trong cây CDA: `03 04 [u64 Element ID] [u16 số ký tự] tên UTF-16` với tên kết thúc bằng "[id]"
  * (vd "Basic Roof : SG Metal Panels roof [243274]"). */
-function scanElementNames(raw: Uint8Array): Map<number, string> {
+export function scanElementNames(raw: Uint8Array): Map<number, string> {
   const { u32 } = views(raw), out = new Map<number, string>();
   for (let q = 0; q + 12 <= raw.length; q++) {
     if (raw[q] !== 3 || raw[q + 1] !== 4 || raw[q + 6] || raw[q + 7] || raw[q + 8] || raw[q + 9]) continue;
@@ -222,8 +222,22 @@ function scanElementNames(raw: Uint8Array): Map<number, string> {
   return out;
 }
 
-export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
-  const recs = scanRecords(raw);
+/** Kết quả các lượt quét đã tính sẵn (song song ở worker phụ — xem parseTvParallel trong worker.ts); thiếu mục nào thì parseTv tự quét như cũ. */
+export interface TvPre {
+  recs?: TvRecord[];
+  elements?: { db: number; id: number }[];
+  elementNames?: Map<number, string>;
+  /** mỗi phần tử: off + 16 số Matrix4.elements */
+  xfs?: { off: number; M: THREE.Matrix4 }[];
+  materials?: Map<number, number>;
+  opacity?: Map<number, number>;
+  colors?: { o: number; c: number }[];
+  matUse?: { o: number; c: number; a: number }[];
+  unitMM?: number | null;
+}
+
+export function parseTv(raw: Uint8Array, shells: Shell[], pre?: TvPre): VsfxModel {
+  const recs = pre?.recs ?? scanRecords(raw);
   const cnt = new Map<number, number>();
   for (const r of recs) if (r.h != null) cnt.set(r.h, (cnt.get(r.h) ?? 0) + 1);
   const MO = [...cnt.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
@@ -261,7 +275,7 @@ export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
   const topKids = [...new Set(recs.filter(r => r.h === MO).flatMap(r => r.kids))].sort((x, y) => x - y);
   const topOf = (g: number) => { const i = lastLE(topKids, g, identity); return i >= 0 ? topKids[i] : undefined; };
   // Phần tử Revit chứa đối tượng = bản ghi phần tử có handle CSDL lớn nhất ≤ handle đối tượng (handle cấp theo DFS)
-  const elements = scanElements(raw), elementNames = scanElementNames(raw);
+  const elements = pre?.elements ?? scanElements(raw), elementNames = pre?.elementNames ?? scanElementNames(raw);
   const elementOf = (h: number | undefined) => {
     if (h == null) return undefined;
     const i = lastLE(elements, h, e => e.db);
@@ -271,7 +285,7 @@ export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
 
   const holders = new Map<number, Holder[]>();   // scope -> các bản ghi mang ma trận
   let nxf = 0;
-  scanTransforms(raw, 0, (o, M) => {
+  const onXf = (o: number, M: THREE.Matrix4) => {
     nxf++;
     const ri = recAt(o), H = ri >= 0 ? recs[ri].h : null;
     if (H == null) return;
@@ -279,12 +293,13 @@ export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
     const list = holders.get(sc) ?? [];
     list.push({ H, E: endOf(H), M });
     holders.set(sc, list);
-  });
+  };
+  if (pre?.xfs) for (const x of pre.xfs) onXf(x.off, x.M); else scanTransforms(raw, 0, onXf);
 
-  const opacity = new Map<number, number>();
-  const materials = scanMaterials(raw, opacity);
-  const colors = scanColors(raw);
-  const matUse = scanMaterialUse(raw, materials, opacity);
+  const opacity = pre?.opacity ?? new Map<number, number>();
+  const materials = pre?.materials ?? scanMaterials(raw, opacity);
+  const colors = pre?.colors ?? scanColors(raw);
+  const matUse = pre?.matUse ?? scanMaterialUse(raw, materials, opacity);
 
   // gán ma trận + màu cho từng shell; gom các shell liền nhau giống nhau thành instance
   const instances: Instance[] = [], ident = new THREE.Matrix4(), mCache = new Map<string, THREE.Matrix4>();
@@ -388,7 +403,7 @@ export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
   if (views) fixHeadTexts(live, views);
   return {
     format: 'OdTv (Revit)', sheet, plan, views, shells, instances: live, records: recs.length, transforms: nxf,
-    inserts: 0, skipped: 0, unitMM: detectUnitMM(raw) ?? 304.8, materials,
+    inserts: 0, skipped: 0, unitMM: (pre?.unitMM !== undefined ? pre.unitMM : detectUnitMM(raw)) ?? 304.8, materials,
   };
 }
 

@@ -24,7 +24,7 @@ export interface SliceJob {
 }
 
 /** Lượt quét giao cho worker phụ khi phân tích song song (raw nằm trong SharedArrayBuffer dùng chung). */
-export type ScanTask = 'nodesXfs' | 'entUnit' | 'srcExt';
+export type ScanTask = 'nodesXfs' | 'entUnit' | 'srcExt' | 'tvText' | 'tvXfm' | 'tvRecs' | 'tvMats';
 export interface ScanJob { id: number; task: ScanTask; raw: Uint8Array }
 export interface ScanResult {
   id: number;
@@ -36,4 +36,13 @@ export interface ScanResult {
   srcRecs?: { o: number; id: number }[];
   unitMM?: number | null;
   ext?: { h: number; bb: number[] }[];
+  /** nhánh OdTv/Revit */
+  shells?: import('./types').Shell[];
+  elementNames?: Map<number, string>;
+  recs?: import('./parseTv').TvRecord[];
+  elements?: { db: number; id: number }[];
+  colors?: { o: number; c: number }[];
+  materials?: Map<number, number>;
+  opacity?: Map<number, number>;
+  matUse?: { o: number; c: number; a: number }[];
 }

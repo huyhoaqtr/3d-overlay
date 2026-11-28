@@ -4,7 +4,8 @@
 import { readStream } from './container';
 import * as THREE from 'three';
 import { parseRaw, summarize } from './parse';
-import { parseIfc, type IfcPre } from './parseIfc';
+import { parseIfc } from './parseIfc';
+import { parseTv } from './parseTv';
 import { scanShells } from './scan';
 import { isLowMemoryDevice } from './device';
 import { buildMeshData, entityIds, meshDataTransferables, mergeMeshData } from './meshData';
@@ -22,12 +23,12 @@ let model: VsfxModel | null = null;
 
 const post = (msg: WorkerResponse, transfer: Transferable[] = []) => scope.postMessage(msg, transfer);
 
-/* Phân tích SONG SONG cho file IFC lớn (file_14: 263 MB, ~5.4 s tuần tự): các lượt quét byte độc lập nhau nên chia cho 3 worker phụ (A: node + ma trận ~1.8 s; B: header entity + đơn vị ~1.5 s;
+/* Phân tích SONG SONG cho file lớn (IFC: file_14 263 MB ~5.4 s tuần tự; OdTv/Revit: file_1 201 MB ~7.3 s): các lượt quét byte độc lập nhau nên chia cho 3 worker phụ (A: node + ma trận ~1.8 s; B: header entity + đơn vị ~1.5 s;
  * C: handle nguồn + bảng extents ~1.9 s) chạy cùng lúc, worker này quét shell; rồi parseIfc dùng kết quả tính sẵn.
  * Luồng nằm trong SharedArrayBuffer (khi trang cô lập chéo nguồn, xem vite.config.ts) thì dùng chung không sao chép; không thì mỗi worker nhận BẢN SAO (3 × kích thước luồng bộ nhớ tạm) —
  * chỉ chấp nhận tới COPY_MAX. Không đủ điều kiện (không phải IFC, luồng quá lớn để sao chép) hoặc lỗi -> trả null để phân tích tuần tự như cũ. */
 const COPY_MAX = 320 * 1024 * 1024;
-const PARSE_PARALLEL_MIN = 64 * 1024 * 1024;   // dưới ngưỡng này phân tích tuần tự đã nhanh (khởi động worker phụ không đáng)
+const PARSE_PARALLEL_MIN = 32 * 1024 * 1024;   // dưới ngưỡng này phân tích tuần tự đã nhanh (khởi động worker phụ không đáng)
 /** Thiết bị ít RAM: ít worker phụ hơn và không sao chép luồng 263 MB (mỗi worker phụ và mỗi bản sao đều tính vào giới hạn ~1–1.5 GB của tab iOS) — xem device.ts. */
 const lowMemory = isLowMemoryDevice();
 
@@ -41,10 +42,19 @@ function looksLikeIfc(raw: Uint8Array): boolean {
   return false;
 }
 
+/** Mảng phẳng (off + 16 số Matrix4.elements mỗi mục) -> danh sách { off, M }. */
+function rehydrateXfs(f: Float64Array): { off: number; M: THREE.Matrix4 }[] {
+  const xfs: { off: number; M: THREE.Matrix4 }[] = [];
+  for (let i = 0; i + 17 <= f.length; i += 17) xfs.push({ off: f[i], M: new THREE.Matrix4().fromArray(Array.from(f.subarray(i + 1, i + 17))) });
+  return xfs;
+}
+
 async function parseParallel(raw: Uint8Array): Promise<VsfxModel | null> {
   const shared = typeof SharedArrayBuffer !== 'undefined' && raw.buffer instanceof SharedArrayBuffer;
-  if (raw.length < PARSE_PARALLEL_MIN || (!shared && (lowMemory || raw.length > COPY_MAX)) || !looksLikeIfc(raw)) return null;
-  const tasks: ScanTask[] = ['nodesXfs', 'entUnit', 'srcExt'];
+  if (raw.length < PARSE_PARALLEL_MIN || (!shared && (lowMemory || raw.length > COPY_MAX))) return null;
+  const ifc = looksLikeIfc(raw);
+  // IFC: 3 nhóm quét. OdTv/Revit (file_1: 13 lượt quét độc lập, ~7.3 s tuần tự): 4 nhóm cân nhau ~1.2–2 s — chữ/đường/vòng tròn; ma trận + tên phần tử + đơn vị; bản ghi + phần tử + màu; vật liệu + dò marker IFC.
+  const tasks: ScanTask[] = ifc ? ['nodesXfs', 'entUnit', 'srcExt'] : ['tvText', 'tvXfm', 'tvRecs', 'tvMats'];
   while (scanHelpers.length < tasks.length) scanHelpers.push(new Worker(new URL('./scanWorker.ts', import.meta.url), { type: 'module' }));
   const run = (h: Worker, task: ScanTask) => new Promise<ScanResult>((resolve, reject) => {
     const id = ++scanJobId;
@@ -54,12 +64,20 @@ async function parseParallel(raw: Uint8Array): Promise<VsfxModel | null> {
     h.postMessage(job);
   });
   const pending = tasks.map((t, i) => run(scanHelpers[i], t));
-  const shells = scanShells(raw);   // cùng lúc với 3 nhóm quét ở worker phụ
-  const [nx, eu, se] = await Promise.all(pending);
-  if (!nx.nodes || !nx.nodes.length || !nx.xfs) return null;
-  const f = nx.xfs, xfs: IfcPre['xfs'] = [];
-  for (let i = 0; i + 17 <= f.length; i += 17) xfs.push({ off: f[i], M: new THREE.Matrix4().fromArray(Array.from(f.subarray(i + 1, i + 17))) });
-  return parseIfc(raw, shells, nx.nodes, { xfs, ents: eu.ents, srcRecs: se.srcRecs, unitMM: eu.unitMM, ext: se.ext });
+  const shells = scanShells(raw);   // cùng lúc với các nhóm quét ở worker phụ
+  const res = await Promise.all(pending);
+  if (ifc) {
+    const [nx, eu, se] = res;
+    if (!nx.nodes || !nx.nodes.length || !nx.xfs) return null;
+    return parseIfc(raw, shells, nx.nodes, { xfs: rehydrateXfs(nx.xfs), ents: eu.ents, srcRecs: se.srcRecs, unitMM: eu.unitMM, ext: se.ext });
+  }
+  const [tx, xm, rc, mt] = res;
+  if (!tx.shells || !xm.xfs || !rc.recs || !mt.materials || !mt.matUse) return null;
+  if (mt.nodes && mt.nodes.length) return null;   // có marker IFC ngoài 48 MB đầu mà dò nhanh bỏ sót: để parseRaw tuần tự quyết định nhánh
+  return parseTv(raw, [...shells, ...tx.shells].sort((a, b) => a.off - b.off), {
+    recs: rc.recs, elements: rc.elements, colors: rc.colors, elementNames: xm.elementNames, xfs: rehydrateXfs(xm.xfs), unitMM: xm.unitMM,
+    materials: mt.materials, opacity: mt.opacity, matUse: mt.matUse,
+  });
 }
 
 function dropScanHelpers() { for (const h of scanHelpers) h.terminate(); scanHelpers.length = 0; }
