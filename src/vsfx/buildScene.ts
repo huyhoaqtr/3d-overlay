@@ -130,7 +130,7 @@ export class SceneModel {
 
       const eg = new THREE.BufferGeometry();
       eg.setAttribute('position', new THREE.BufferAttribute(c.edges, 3));
-      eg.computeBoundingSphere();
+      if (c.edges.length) eg.computeBoundingSphere();   // noEdges (thiết bị ít RAM, model rất lớn): hình học cạnh rỗng
       const lines = new THREE.LineSegments(eg, wire ? wireMat(c.color) : c.kind === 'glass' ? glassEdge : edgeMat);
       lines.name = 'edges';
       if (!wire) lines.raycast = () => {};        // chỉ chọn theo mặt, không theo cạnh (đường dữ liệu kiểu 05 thì chọn được)

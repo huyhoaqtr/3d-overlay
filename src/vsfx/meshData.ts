@@ -308,7 +308,7 @@ export function entityIds(instances: VsfxModel['instances']): { idOf: number[]; 
 
 /** `slice`: dựng lưới cho MỘT LÁT liên tiếp của danh sách instance (dựng song song nhiều worker): `base` = chỉ số toàn cục của instance đầu lát, `idOf` = bảng id đối tượng TOÀN CỤC
  *  (tính một lần từ cả danh sách instance). Chỉ dùng cho model thường (không phải bản vẽ). */
-export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }: BuildOptions, slice?: { base: number; idOf: number[] }): MeshData {
+export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn, noEdges }: BuildOptions, slice?: { base: number; idOf: number[] }): MeshData {
   const { instances, unitMM } = model;
   const accs = new Map<string, Acc>();
   const v = new THREE.Vector3(), c3 = new THREE.Color();
@@ -661,7 +661,9 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
         }
         let edges: Float32Array;
         const sp = spans[kind];
-        if (positions.length / 9 > 30000 && sp.length > 1 && sp[sp.length - 1] === positions.length) {
+        if (noEdges) {
+          edges = new Float32Array(0);
+        } else if (positions.length / 9 > 30000 && sp.length > 1 && sp[sp.length - 1] === positions.length) {
           // Bucket khổng lồ (file_13: 1 part 335 shell, 330 000 tam giác): lọc cạnh trên cả bucket là phi tuyến (lưới không gian + T-junction) -> treo hàng chục giây.
           // Các shell độc lập không chia cạnh với nhau nên lọc từng shell riêng (shell lớn nhất 40 000 tam giác ≈ 0.5 s).
           const pieces: Float32Array[] = [];
@@ -793,4 +795,10 @@ export function mergeMeshData(parts: MeshData[], entities: string[], handles: st
     chunks.push({ kind: list[0].kind, color: list[0].color, opacity: list[0].opacity, positions, normals, colors, edges, ranges });
   }
   return { chunks, entities, handles, texts: [], sheet: false, plan: false };
+}
+
+/** Ghép danh sách MeshData KHÔNG nối chunk (không sao chép mảng): chỉ xếp các chunk của từng lát cạnh nhau. Nhiều draw call hơn (số chunk × số lát) nhưng không cần thêm bộ nhớ như mergeMeshData
+ *  (đỉnh 2 × kích thước lưới) — dùng cho thiết bị ít RAM. Hiển thị giống hệt: mỗi chunk có bảng range riêng, entity trải trên nhiều chunk đã được hỗ trợ. */
+export function concatMeshData(parts: MeshData[], entities: string[], handles: string[]): MeshData {
+  return { chunks: parts.flatMap(d => d.chunks), entities, handles, texts: [], sheet: false, plan: false };
 }

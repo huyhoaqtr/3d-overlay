@@ -8,7 +8,7 @@ import { parseIfc } from './parseIfc';
 import { parseTv } from './parseTv';
 import { scanShells } from './scan';
 import { isLowMemoryDevice } from './device';
-import { buildMeshData, entityIds, meshDataTransferables, mergeMeshData } from './meshData';
+import { buildMeshData, concatMeshData, entityIds, meshDataTransferables, mergeMeshData } from './meshData';
 import type { ScanJob, ScanResult, ScanTask, SliceJob, WorkerRequest, WorkerResponse } from './messages';
 import type { BuildOptions, MeshData, VsfxModel } from './types';
 
@@ -89,6 +89,7 @@ interface SliceReply { id: number; data?: MeshData; error?: string }
 const helpers: Worker[] = [];
 let jobId = 0;
 const PARALLEL_MIN_VERTS = 400_000, PARALLEL_MIN_INSTANCES = 1000;
+const LOWMEM_NO_EDGES_VERTS = 1_500_000;
 
 const modelCosts = (m: VsfxModel) => m.instances.map(i => i.parts.reduce((a, p) => a + p.shells.reduce((b, s) => b + s.verts.length / 3, 0), 0));
 
@@ -145,7 +146,8 @@ async function buildParallel(m: VsfxModel, options: BuildOptions, costs: number[
   maybeFinish();
   await allDone;
   if (failed) throw failed;
-  return mergeMeshData(results as MeshData[], names, handles);
+  // thiết bị ít RAM: không nối chunk (nối cần thêm một bản sao toàn bộ lưới — đỉnh bộ nhớ gấp đôi)
+  return (lowMemory ? concatMeshData : mergeMeshData)(results as MeshData[], names, handles);
 }
 
 let keptBuffer: ArrayBuffer | null = null;
@@ -173,13 +175,14 @@ scope.onmessage = async (e: MessageEvent<WorkerRequest>) => {
       if (!model) throw new Error('Chưa có model để dựng lưới');
       post({ type: 'progress', id: req.id, stage: 'mesh' });
       let data: MeshData | null = null;
-      if (!model.sheet && !model.plan && model.instances.length >= PARALLEL_MIN_INSTANCES) {
-        const costs = modelCosts(model);
-        if (costs.reduce((a, b) => a + b, 0) >= PARALLEL_MIN_VERTS) {
-          try { data = await buildParallel(model, req.options, costs); } catch (err) { console.warn('Dựng song song lỗi, dựng tuần tự:', err); dropHelpers(); data = null; }
-        }
+      const costs = !model.sheet && !model.plan ? modelCosts(model) : null;
+      const totalVerts = costs ? costs.reduce((a, b) => a + b, 0) : 0;
+      // thiết bị ít RAM + model rất lớn (file_14 ≈ 4 triệu đỉnh shell): bỏ cạnh của mặt (~90 MB CPU + ~90 MB GPU) để tab iOS không bị giết
+      const options: BuildOptions = lowMemory && totalVerts >= LOWMEM_NO_EDGES_VERTS ? { ...req.options, noEdges: true } : req.options;
+      if (costs && model.instances.length >= PARALLEL_MIN_INSTANCES && totalVerts >= PARALLEL_MIN_VERTS) {
+        try { data = await buildParallel(model, options, costs); } catch (err) { console.warn('Dựng song song lỗi, dựng tuần tự:', err); dropHelpers(); data = null; }
       }
-      if (!data) data = buildMeshData(model, req.options);
+      if (!data) data = buildMeshData(model, options);
       if (lowMemory && keptBuffer) model = null;
       post({ type: 'built', id: req.id, data }, meshDataTransferables(data));
     }

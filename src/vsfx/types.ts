@@ -188,7 +188,8 @@ export interface MeshData {
   plan: boolean;
 }
 
-export type BuildOptions = Pick<ViewOptions, 'glass' | 'debugColors'>;
+/** noEdges: không dựng cạnh của mặt (chỉ worker đặt, khi thiết bị ít RAM mở model quá lớn — cạnh chiếm ~90 MB × 2 (CPU + GPU) với file_14) */
+export type BuildOptions = Pick<ViewOptions, 'glass' | 'debugColors'> & { noEdges?: boolean };
 
 export type LoadStage = 'decompress' | 'parse' | 'mesh';
 
