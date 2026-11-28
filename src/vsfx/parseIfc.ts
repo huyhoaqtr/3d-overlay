@@ -22,7 +22,7 @@ export interface IfcNode {
   handle: number;
 }
 
-interface Entity {
+export interface Entity {
   p: number;
   name: string;
   color: number;
@@ -62,7 +62,7 @@ function insertMatrix({ P, S, ang, N }: InsertParams): THREE.Matrix4 {
     .multiply(new THREE.Matrix4().makeScale(S[0], S[1], S[2]));
 }
 
-function scanEntities(raw: Uint8Array): Entity[] {
+export function scanEntities(raw: Uint8Array): Entity[] {
   const L = raw.length, { f64, u32 } = views(raw), ents: Entity[] = [];
   for (let p = 3; p + 5 <= L; p++) {
     if (raw[p] < 0xc0 || raw[p] > 0xc8) continue;
@@ -93,15 +93,25 @@ function scanEntities(raw: Uint8Array): Entity[] {
   return ents;
 }
 
-export function parseIfc(raw: Uint8Array, shells: Shell[], nodes: IfcNode[]): VsfxModel {
+/** Kết quả các lượt quét đã tính sẵn (song song ở worker phụ — xem parseParallel trong worker.ts); thiếu mục nào thì parseIfc tự quét như cũ. */
+export interface IfcPre {
+  xfs?: { off: number; M: THREE.Matrix4 }[];
+  ents?: Entity[];
+  srcRecs?: { o: number; id: number }[];
+  /** null = file không có bản ghi đơn vị (khác undefined = chưa tính) */
+  unitMM?: number | null;
+  ext?: ReturnType<typeof scanExtents>;
+}
+
+export function parseIfc(raw: Uint8Array, shells: Shell[], nodes: IfcNode[], pre?: IfcPre): VsfxModel {
   const L = raw.length;
   const ownerCount = new Map<number, number>();
   for (const n of nodes) ownerCount.set(n.owner, (ownerCount.get(n.owner) ?? 0) + 1);
   const modelOwner = [...ownerCount.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
 
-  const xfs: { off: number; M: THREE.Matrix4 }[] = [];
-  scanTransforms(raw, nodes[0].off - 2000, (off, M) => xfs.push({ off, M }));
-  const ents = scanEntities(raw);
+  let xfs = pre?.xfs;
+  if (!xfs) { const l: { off: number; M: THREE.Matrix4 }[] = []; scanTransforms(raw, nodes[0].off - 2000, (off, M) => l.push({ off, M })); xfs = l; }
+  const ents = pre?.ents ?? scanEntities(raw);
   const nodeAt = (p: number) => lastLE(nodes, p, n => n.off);
 
   // Mỗi header -> một "phần" gồm các shell đứng sau nó (tới header/node kế tiếp).
@@ -130,7 +140,7 @@ export function parseIfc(raw: Uint8Array, shells: Shell[], nodes: IfcNode[]): Vs
   //  - entity thường: là node đứng sau dữ liệu của nó (cây dont.vsfx = 18258, xác nhận bằng viewer gốc);
   //  - INSERT (cửa sổ/cửa đi, OdIfcRepresentationMap): có bản ghi riêng ngay sau tên (77022, 77033… tăng dần) —
   //    trước đây lấy node phía sau nên cửa sổ bị gộp vào sàn/tường đứng sau chúng.
-  const srcRecs = scanSourceRecords(raw);
+  const srcRecs = pre?.srcRecs ?? scanSourceRecords(raw);
   const nodeHandleAfter = (p: number) => {
     const k = lastLE(srcRecs, p, r => r.o) + 1;
     return k < srcRecs.length ? String(srcRecs[k].id) : undefined;
@@ -162,8 +172,8 @@ export function parseIfc(raw: Uint8Array, shells: Shell[], nodes: IfcNode[]): Vs
     lastGroup = instances.length;
     instances.push({ parts, M: lastM, name: e.name, group: lastGroup, handle: nodeHandleAfter(e.p) });
   }
-  const unitMM = detectUnitMM(raw) ?? 1;
-  const ext = scanExtents(raw);
+  const unitMM = (pre?.unitMM !== undefined ? pre.unitMM : detectUnitMM(raw)) ?? 1;
+  const ext = pre?.ext ?? scanExtents(raw);
   resolveBlockMatrices(ext, instances, blocks, unitMM);
   assignDbHandles(ext, instances, unitMM);
   return {

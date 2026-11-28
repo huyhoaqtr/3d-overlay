@@ -2,9 +2,12 @@
  * Model đầy đủ (shell, ma trận…) ở lại trong worker; main thread chỉ nhận tóm tắt và MeshData
  * (các Float32Array được chuyển giao, không sao chép). */
 import { readStream } from './container';
+import * as THREE from 'three';
 import { parseRaw, summarize } from './parse';
+import { parseIfc, type IfcPre } from './parseIfc';
+import { scanShells } from './scan';
 import { buildMeshData, entityIds, meshDataTransferables, mergeMeshData } from './meshData';
-import type { SliceJob, WorkerRequest, WorkerResponse } from './messages';
+import type { ScanJob, ScanResult, ScanTask, SliceJob, WorkerRequest, WorkerResponse } from './messages';
 import type { BuildOptions, MeshData, VsfxModel } from './types';
 
 // Kiểu tối thiểu cho phạm vi worker (lib "WebWorker" xung đột với lib "DOM" trong cùng tsconfig).
@@ -18,8 +21,47 @@ let model: VsfxModel | null = null;
 
 const post = (msg: WorkerResponse, transfer: Transferable[] = []) => scope.postMessage(msg, transfer);
 
+/* Phân tích SONG SONG cho file IFC lớn (file_14: 263 MB, ~5.4 s tuần tự): các lượt quét byte độc lập nhau nên chia cho 3 worker phụ (A: node + ma trận ~1.8 s; B: header entity + đơn vị ~1.5 s;
+ * C: handle nguồn + bảng extents ~1.9 s) chạy cùng lúc, worker này quét shell; rồi parseIfc dùng kết quả tính sẵn.
+ * Luồng nằm trong SharedArrayBuffer (khi trang cô lập chéo nguồn, xem vite.config.ts) thì dùng chung không sao chép; không thì mỗi worker nhận BẢN SAO (3 × kích thước luồng bộ nhớ tạm) —
+ * chỉ chấp nhận tới COPY_MAX. Không đủ điều kiện (không phải IFC, luồng quá lớn để sao chép) hoặc lỗi -> trả null để phân tích tuần tự như cũ. */
+const COPY_MAX = 320 * 1024 * 1024;
+const PARSE_PARALLEL_MIN = 64 * 1024 * 1024;   // dưới ngưỡng này phân tích tuần tự đã nhanh (khởi động worker phụ không đáng)
+const scanHelpers: Worker[] = [];
+let scanJobId = 0;
+
+function looksLikeIfc(raw: Uint8Array): boolean {
+  const lim = Math.min(raw.length - 12, 48 * 1024 * 1024);
+  for (let o = raw.indexOf(0x40); o !== -1 && o < lim; o = raw.indexOf(0x40, o + 1))
+    if (raw[o + 1] === 0x10 && raw[o + 2] === 0x11 && !raw[o + 3] && !raw[o + 4] && raw[o + 5] === 1 && raw[o + 6] === 1 && !raw[o + 7] && !raw[o + 8] && !raw[o + 9] && (raw[o + 10] === 0x70 || raw[o + 10] === 0x72)) return true;
+  return false;
+}
+
+async function parseParallel(raw: Uint8Array): Promise<VsfxModel | null> {
+  const shared = typeof SharedArrayBuffer !== 'undefined' && raw.buffer instanceof SharedArrayBuffer;
+  if (raw.length < PARSE_PARALLEL_MIN || (!shared && raw.length > COPY_MAX) || !looksLikeIfc(raw)) return null;
+  const tasks: ScanTask[] = ['nodesXfs', 'entUnit', 'srcExt'];
+  while (scanHelpers.length < tasks.length) scanHelpers.push(new Worker(new URL('./scanWorker.ts', import.meta.url), { type: 'module' }));
+  const run = (h: Worker, task: ScanTask) => new Promise<ScanResult>((resolve, reject) => {
+    const id = ++scanJobId;
+    h.onmessage = (e: MessageEvent<ScanResult>) => { if (e.data.id !== id) return; if (e.data.error) reject(new Error(e.data.error)); else resolve(e.data); };
+    h.onerror = ev => reject(new Error(ev.message || 'worker quét lỗi'));
+    const job: ScanJob = { id, task, raw };
+    h.postMessage(job);
+  });
+  const pending = tasks.map((t, i) => run(scanHelpers[i], t));
+  const shells = scanShells(raw);   // cùng lúc với 3 nhóm quét ở worker phụ
+  const [nx, eu, se] = await Promise.all(pending);
+  if (!nx.nodes || !nx.nodes.length || !nx.xfs) return null;
+  const f = nx.xfs, xfs: IfcPre['xfs'] = [];
+  for (let i = 0; i + 17 <= f.length; i += 17) xfs.push({ off: f[i], M: new THREE.Matrix4().fromArray(Array.from(f.subarray(i + 1, i + 17))) });
+  return parseIfc(raw, shells, nx.nodes, { xfs, ents: eu.ents, srcRecs: se.srcRecs, unitMM: eu.unitMM, ext: se.ext });
+}
+
+function dropScanHelpers() { for (const h of scanHelpers) h.terminate(); scanHelpers.length = 0; }
+
 /* Dựng lưới SONG SONG cho model lớn (file_14: 79 000 instance, 7.7 triệu tam giác, ~22 s tuần tự): chia danh sách instance thành các lát liên tiếp có tổng số đỉnh gần bằng nhau,
- * giao lát 1…H cho worker phụ (buildWorker.ts), worker này dựng lát 0, rồi ghép theo thứ tự (mergeMeshData) — kết quả giống từng số với dựng tuần tự.
+ * giao cho các worker phụ (buildWorker.ts; worker này chỉ điều phối), rồi ghép theo thứ tự (mergeMeshData) — kết quả giống từng số với dựng tuần tự.
  * Worker phụ giữ lại giữa các lần dựng (đổi kính/màu debug dựng lại không phải khởi động lại). Lỗi bất kỳ -> trả null để dựng tuần tự như cũ. */
 interface SliceReply { id: number; data?: MeshData; error?: string }
 const helpers: Worker[] = [];
@@ -32,10 +74,10 @@ function dropHelpers() { for (const h of helpers) h.terminate(); helpers.length 
 
 async function buildParallel(m: VsfxModel, options: BuildOptions, costs: number[]): Promise<MeshData | null> {
   const cores = (self as unknown as { navigator?: { hardwareConcurrency?: number } }).navigator?.hardwareConcurrency ?? 4;
-  const nHelpers = Math.max(0, Math.min(7, cores - 2));   // chừa 1 lõi cho main thread/UI, 1 cho chính worker này
-  if (nHelpers < 1) return null;
-  // Nhiều lát nhỏ hơn số worker (×4) và lấy lát kế tiếp khi rảnh: chi phí thật mỗi instance (lọc cạnh) không tỉ lệ đúng với số đỉnh nên chia đều từ đầu bị lệch (lát chậm nhất 5.5 s so với 2 s)
-  const nSlices = Math.min(costs.length, (nHelpers + 1) * 4), total = costs.reduce((a, b) => a + b, 0);
+  const nHelpers = Math.max(0, Math.min(8, cores - 1));   // chừa 1 lõi cho main thread/UI; worker này chỉ điều phối (không dựng lát) nên luôn phản hồi ngay
+  if (nHelpers < 2) return null;
+  // Nhiều lát nhỏ hơn số worker (×6) và lấy lát kế tiếp khi rảnh: chi phí thật mỗi instance (lọc cạnh) không tỉ lệ đúng với số đỉnh nên chia đều từ đầu bị lệch (lát chậm nhất 5.5 s so với 2 s)
+  const nSlices = Math.min(costs.length, nHelpers * 6), total = costs.reduce((a, b) => a + b, 0);
   const bounds = [0];
   let acc = 0, next = 1;
   for (let i = 0; i < costs.length && next < nSlices; i++) {
@@ -54,29 +96,30 @@ async function buildParallel(m: VsfxModel, options: BuildOptions, costs: number[
   const takeSlice = () => (failed || nextSlice >= nS ? -1 : nextSlice++);
   const maybeFinish = () => { if (outstanding === 0 && (failed || nextSlice >= nS)) finish(); };
 
+  // Mỗi worker phụ giữ sẵn tối đa DEPTH lát trong hàng đợi để không phải chờ vòng giao việc kế tiếp (sao chép dữ liệu lát nằm ở worker này)
+  const DEPTH = 2;
+  const jobSlice = new Map<number, number>();
   const dispatch = (h: Worker) => {
     const k = takeSlice();
     if (k < 0) { maybeFinish(); return; }
     const lo = bounds[k], hi = bounds[k + 1], id = ++jobId;
     outstanding++;
+    jobSlice.set(id, k);
+    const job: SliceJob = { id, instances: m.instances.slice(lo, hi).map(i => ({ ...i, M: Array.from(i.M.elements) })), unitMM: m.unitMM, options, base: lo, idOf };
+    h.postMessage(job);
+  };
+  for (const h of helpers) {
     h.onmessage = (e: MessageEvent<SliceReply>) => {
-      if (e.data.id !== id) return;
+      const k = jobSlice.get(e.data.id);
+      if (k === undefined) return;
+      jobSlice.delete(e.data.id);
       outstanding--;
       if (e.data.data) { results[k] = e.data.data; dispatch(h); } else { failed = new Error(e.data.error ?? 'worker phụ lỗi'); maybeFinish(); }
     };
     h.onerror = ev => { outstanding--; failed = new Error(ev.message || 'worker phụ lỗi'); maybeFinish(); };
-    const job: SliceJob = { id, instances: m.instances.slice(lo, hi).map(i => ({ ...i, M: Array.from(i.M.elements) })), unitMM: m.unitMM, options, base: lo, idOf };
-    h.postMessage(job);
-  };
-  for (const h of helpers) dispatch(h);
-
-  // chính worker này cũng dựng lát (xen kẽ nhường vòng lặp sự kiện để nhận kết quả và giao tiếp lát cho worker phụ vừa rảnh)
-  for (;;) {
-    const k = takeSlice();
-    if (k < 0) break;
-    results[k] = buildMeshData({ ...m, instances: m.instances.slice(bounds[k], bounds[k + 1]) }, options, { base: bounds[k], idOf });
-    await new Promise<void>(r => setTimeout(r, 0));
   }
+  for (let d = 0; d < DEPTH; d++) for (const h of helpers) dispatch(h);
+
   maybeFinish();
   await allDone;
   if (failed) throw failed;
@@ -91,7 +134,9 @@ scope.onmessage = async (e: MessageEvent<WorkerRequest>) => {
       post({ type: 'progress', id: req.id, stage: 'decompress' });
       const raw = await readStream(req.buffer);
       post({ type: 'progress', id: req.id, stage: 'parse' });
-      model = parseRaw(raw);
+      let parsed: VsfxModel | null = null;
+      try { parsed = await parseParallel(raw); } catch (err) { console.warn('Phân tích song song lỗi, phân tích tuần tự:', err); dropScanHelpers(); }
+      model = parsed ?? parseRaw(raw);
       post({ type: 'loaded', id: req.id, summary: summarize(model) });
     } else {
       if (!model) throw new Error('Chưa có model để dựng lưới');

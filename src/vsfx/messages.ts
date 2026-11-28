@@ -22,3 +22,18 @@ export interface SliceJob {
   base: number;
   idOf: number[];
 }
+
+/** Lượt quét giao cho worker phụ khi phân tích song song (raw nằm trong SharedArrayBuffer dùng chung). */
+export type ScanTask = 'nodesXfs' | 'entUnit' | 'srcExt';
+export interface ScanJob { id: number; task: ScanTask; raw: Uint8Array }
+export interface ScanResult {
+  id: number;
+  task: ScanTask;
+  error?: string;
+  nodes?: import('./parseIfc').IfcNode[];
+  xfs?: Float64Array;
+  ents?: import('./parseIfc').Entity[];
+  srcRecs?: { o: number; id: number }[];
+  unitMM?: number | null;
+  ext?: { h: number; bb: number[] }[];
+}
