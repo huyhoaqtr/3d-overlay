@@ -11,7 +11,8 @@ export function parseRaw(raw: Uint8Array): VsfxModel {
   const nodes = scanIfcNodes(raw);
   // Đường gấp khúc (kiểu 05) chỉ nhận cho nhánh OdTv/Revit; nhánh IFC giữ nguyên (không file IFC mẫu nào có).
   if (nodes.length) return parseIfc(raw, shells, nodes);
-  return parseTv(raw, [...shells, ...scanLines(raw), ...scanCircles(raw), ...scanTexts(raw)].sort((a, b) => a.off - b.off));
+  const texts = scanTexts(raw);   // file bản vẽ (nhiều chữ): nhận cả đường không có bản ghi màu (đường lưới/kích thước)
+  return parseTv(raw, [...shells, ...scanLines(raw, texts.length >= 50), ...scanCircles(raw), ...texts].sort((a, b) => a.off - b.off));
 }
 
 export function summarize(model: VsfxModel): ModelSummary {

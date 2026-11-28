@@ -89,7 +89,7 @@ export class SceneModel {
       const key = kind === 'faceCol' ? kind : `${kind}:${color}:${opacity}`;
       let m = mats.get(key);
       if (!m) {
-        if (kind === 'glass' && data.sheet) {   // bản vẽ: kính tô phẳng xanh nhạt (màu meshData đã đặt), không chiếu sáng
+        if (kind === 'glass' && (data.sheet || data.plan)) {   // bản vẽ: kính tô phẳng xanh nhạt (màu meshData đã đặt), không chiếu sáng
           m = new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide, transparent: true, opacity: 0.6, depthWrite: false });
         } else if (kind === 'glass') {
           // Kính xanh nhạt bán trong suốt: giữ tông màu của file (pha một ít trắng), thêm emissive
@@ -99,7 +99,7 @@ export class SceneModel {
             color: tint, emissive: tint.clone().multiplyScalar(GLASS.emissive), side: THREE.DoubleSide,
             transparent: true, opacity: opacity >= 0 ? Math.min(1, GLASS.opacity * opacity / GLASS.fileOpacityRef) : GLASS.opacity, roughness: .3, metalness: 0, depthWrite: false,
           });
-        } else if (data.sheet)   // bản vẽ: không chiếu sáng — tô phẳng đúng màu như nét in
+        } else if (data.sheet || data.plan)   // bản vẽ: không chiếu sáng — tô phẳng đúng màu như nét in
           m = new THREE.MeshBasicMaterial({
             ...(kind === 'faceCol' ? { vertexColors: true } : { color }), side: THREE.DoubleSide,
             polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,

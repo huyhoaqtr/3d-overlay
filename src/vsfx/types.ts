@@ -77,7 +77,13 @@ export interface Instance {
 export interface SheetView {
   from: number;
   to: number;
+  /** mặt phẳng view: Y = y0 (mặt đứng) hoặc, khi `plan`, độ cao cắt Z = y0 (mặt bằng: chiếu X,Y lên giấy) */
   y0: number;
+  plan?: boolean;
+  /** mặt phẳng (Z, ft) của sàn được rải chấm hatch trong mặt bằng */
+  hatchZ?: number;
+  /** mặt phẳng (Z, ft) của khoảng thông tầng: tô sọc đen dọc */
+  stripeZ?: number;
   a: number;
   b: number;
   s: number;
@@ -104,6 +110,8 @@ export interface VsfxModel {
   unitMM: number;
   /** file bản vẽ (Revit sheet): chỉ vẽ phần trang giấy (instance `paper`), bỏ mô hình 3D */
   sheet?: boolean;
+  /** file bản vẽ nhưng KHÔNG tìm được khung giấy (school_sheet_1.vsfx: chỉ có chữ khung tên, không có đường khung): vẫn mở như bản vẽ 2D — nhìn thẳng từ trên xuống, không xoay — và hiện cả mô hình như mặt bằng */
+  plan?: boolean;
   /** các viewport của file bản vẽ (chỉ khi `sheet`) */
   views?: SheetView[];
   /** handle vật liệu -> màu diffuse (chỉ file OdTv) */
@@ -175,6 +183,8 @@ export interface MeshData {
   texts: TextItem[];
   /** true = file bản vẽ: chỉ có phần trang giấy (nhìn thẳng từ trên xuống) */
   sheet: boolean;
+  /** bản vẽ 2D không khung (xem VsfxModel.plan) */
+  plan: boolean;
 }
 
 export type BuildOptions = Pick<ViewOptions, 'glass' | 'debugColors'>;

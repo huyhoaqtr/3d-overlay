@@ -349,7 +349,11 @@ export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
     // Chữ: màu trong bản ghi màu; không có -> đen (màu đối tượng ở đây là trắng của khung giấy, từng làm "A103" trắng trên giấy trắng).
     // Màu xanh lá của nhãn view KHÔNG nằm trong bản ghi màu hay vật liệu gần đó (đã dò) -> hiệu chỉnh theo ảnh ở meshData (viewLabel).
     if (sh.text) { const tc = lineColor(raw, sh.off - 2); col = tc > 0 ? tc : 0x0a0a0a; alpha = 1; }
-    if (sh.line) { const lc = lineColor(raw, sh.off - 9); col = lc >= 0 ? (lc || 0x0a0a0a) : (curColor || 0x0a0a0a); alpha = 1; }
+    if (sh.line) {
+      const lc = sh.color !== undefined ? sh.color : lineColor(raw, sh.off - 9);   // biến thể có khối thuộc tính: màu nằm ngay trong header
+      col = lc >= 0 ? (lc || 0x0a0a0a) : (curColor || 0x0a0a0a);
+      alpha = 1;
+    }
     if (sh.mat !== undefined && materials.has(sh.mat)) alpha = opacity.get(sh.mat) ?? 1;
     const last = instances[instances.length - 1], grp = groupOf(ck);
     if (last && last.M === M && last.group === grp && last.parts[0].color === col && (last.parts[0].opacity ?? 1) === alpha) last.parts[0].shells.push(sh);
@@ -373,10 +377,17 @@ export function parseTv(raw: Uint8Array, shells: Shell[]): VsfxModel {
   const live = instances.filter(i => i.parts.some(p => p.shells.length));
   if (shells.some(sh => sh.text)) inheritLostMatrices(live);   // file bản vẽ
   const sheet = markPaperSpace(live);
-  const views = sheet ? markViews(live) : undefined;
+  const plan = !sheet && hasTitleBlock(live);
+  let views = sheet ? markViews(live) : undefined;
+  // Sheet không có view mặt đứng đã hiệu chỉnh (school_sheet_1: bản vẽ mặt bằng) -> một viewport mặt bằng chứa mọi thứ không phải giấy
+  if (views && !views.length) addDoorSwings(live);
+  if (views && !views.length) {
+    const first = live.findIndex(i => i.paper);
+    views = [{ from: 0, to: (first > 0 ? first : live.length) - 1, y0: PLAN_VIEW.z0, plan: true, hatchZ: PLAN_VIEW.hatchZ, stripeZ: PLAN_VIEW.stripeZ, a: PLAN_VIEW.a, b: PLAN_VIEW.b, s: 0.01, depth: 0, slab: 'cut', crop: PLAN_VIEW.crop }];
+  }
   if (views) fixHeadTexts(live, views);
   return {
-    format: 'OdTv (Revit)', sheet, views, shells, instances: live, records: recs.length, transforms: nxf,
+    format: 'OdTv (Revit)', sheet, plan, views, shells, instances: live, records: recs.length, transforms: nxf,
     inserts: 0, skipped: 0, unitMM: detectUnitMM(raw) ?? 304.8, materials,
   };
 }
@@ -442,7 +453,7 @@ function markPaperSpace(instances: Instance[]): boolean {
     const b = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
     let lines = 0, other = 0;
     for (const p of ins.parts) for (const sh of p.shells) {
-      if (!sh.line) { other++; continue; }
+      if (!sh.line) { if (!sh.text) other++; continue; }   // chữ khung tên có thể nằm chung instance với khung (school_sheet_1)
       lines++;
       for (let k = 0; k + 2 < sh.verts.length; k += 3)
         for (let d = 0; d < 3; d++) { if (sh.verts[k + d] < b[d]) b[d] = sh.verts[k + d]; if (sh.verts[k + d] > b[d + 3]) b[d + 3] = sh.verts[k + d]; }
@@ -512,6 +523,42 @@ const VIEW_PRESETS: { y0: number; a: number; b: number; crop: [number, number, n
   { y0: -62.49, a: 0.854, b: 1.44, crop: [0.1, 1.3, 1.9, 1.9], depth: 1, slab: 'inside' },
   { y0: -7.16, a: 0.854, b: 0.671, crop: [0.1, 0.52, 1.9, 1.12], depth: 0.3, slab: 'cut' },
 ];
+
+/* Cung mở cửa của mặt bằng (HIỆU CHỈNH theo ảnh gốc, file KHÔNG lưu cung): mỗi cánh cửa chỉ có hai đường song song cách 0.2 ft (độ dày cánh) dài bằng bề rộng cánh (~3 ft) ở z ≈ 7 ft
+ * (trong instance cửa; instance chỉ có đường, không có shell). Gốc instance = tâm cửa, trên mặt phẳng tường; bản lề = đầu cánh gần mặt phẳng tường, đầu kia là mũi cánh. Cung = 1/4 đường tròn tâm ở bản lề,
+ * bán kính = chiều dài cánh, từ mũi cánh tới vị trí đóng (dọc tường về phía tâm cửa). Cánh song song tường thì không vẽ cung. */
+function addDoorSwings(instances: Instance[]) {
+  for (const ins of instances) {
+    if (ins.paper) continue;
+    const e = ins.M.elements, W = (x: number, y: number, z: number) => [e[0] * x + e[4] * y + e[8] * z + e[12], e[1] * x + e[5] * y + e[9] * z + e[13], e[2] * x + e[6] * y + e[10] * z + e[14]];
+    const done: number[][] = [], inv = ins.M.clone().invert();
+    for (const part of ins.parts) for (const sh of part.shells.slice()) {
+      const v = sh.verts;
+      if (!sh.line || sh.circle || v.length !== 6) continue;
+      const a = W(v[0], v[1], v[2]), b = W(v[3], v[4], v[5]), L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      if (!(L > 1.5 && L < 6 && Math.abs(a[2] - 7) < 0.3 && Math.abs(b[2] - a[2]) < 1e-3 && (Math.abs(b[0] - a[0]) < 1e-3 || Math.abs(b[1] - a[1]) < 1e-3))) continue;
+      const ax = Math.abs(b[0] - a[0]) < 1e-3 ? 1 : 0, bx = 1 - ax;   // ax = trục của cánh, bx = trục dọc tường
+      const o = [e[12], e[13]];   // gốc instance = tâm cửa, nằm trên mặt phẳng tường
+      const hingeIsA = Math.abs(a[ax] - o[ax]) < Math.abs(b[ax] - o[ax]);
+      const hinge = hingeIsA ? a : b, tip = hingeIsA ? b : a;
+      if (Math.abs(tip[ax] - o[ax]) < 1.5 || Math.abs(o[bx] - hinge[bx]) < 0.3) continue;   // cánh song song tường / bản lề trùng tâm
+      if (done.some(d => Math.abs(d[0] - hinge[0]) < 0.5 && Math.abs(d[1] - hinge[1]) < 0.5)) continue;   // hai đường của một cánh (dày 0.2 ft)
+      done.push(hinge);
+      const side = Math.sign(o[bx] - hinge[bx]), sgnA = Math.sign(tip[ax] - hinge[ax]), N = 12, pts: number[] = [];
+      for (let i = 0; i <= N; i++) {   // từ mũi cánh (góc 0) tới vị trí đóng (góc 90°) quanh bản lề, về phía tâm cửa
+        const t = (i / N) * Math.PI / 2, p = [0, 0, hinge[2]];
+        p[ax] = hinge[ax] + sgnA * L * Math.cos(t);
+        p[bx] = hinge[bx] + side * L * Math.sin(t);
+        const q = new THREE.Vector3(p[0], p[1], p[2]).applyMatrix4(inv);
+        pts.push(q.x, q.y, q.z);
+      }
+      part.shells.push({ off: -1, end: -1, verts: new Float64Array(pts), faces: new Int32Array(0), faceColors: null, line: true });
+    }
+  }
+}
+
+/** Viewport mặt bằng (HIỆU CHỈNH, chưa đọc từ file): cao độ cắt (ft) và vị trí/khung trên giấy 3.90 × 2.76; tỉ lệ 1:100. */
+const PLAN_VIEW = { z0: 3.9, hatchZ: 0, stripeZ: -0.5, a: 1.016, b: 1.32, crop: [0.2, 0.1, 3.02, 2.6] as [number, number, number, number] };
 
 function markViews(instances: Instance[]): SheetView[] {
   // mặt phẳng chú thích: instance không phải giấy, phẳng theo Y, có chữ
@@ -603,4 +650,16 @@ function inheritLostMatrices(instances: Instance[]) {
     }
   }
   for (const [ins, M] of fix) ins.M = M;
+}
+
+/* Nhận file BẢN VẼ khi không có khung giấy: có một instance chứa ≥ 15 dòng chữ, trong đó có chữ của khung tên Revit ("Scale", "Drawn by", "Checked by",
+ * "Consultan"…). school_sheet_1.vsfx: 57 chữ khung tên trong một instance, 233 chữ cả file, khung giấy/khung tên không có đường nào (chỉ 100 đường toàn file). */
+function hasTitleBlock(instances: Instance[]): boolean {
+  const WORDS = /^(Scale|Drawn by|Checked by|Consultan|Project|number|Issue Date|e-mail)$/;
+  for (const ins of instances) {
+    let texts = 0, words = 0;
+    for (const p of ins.parts) for (const sh of p.shells) if (sh.text) { texts++; if (WORDS.test(sh.text.s)) words++; }
+    if (texts >= 15 && words >= 3) return true;
+  }
+  return false;
 }

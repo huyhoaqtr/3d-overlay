@@ -11,6 +11,7 @@ function viewMatrix(v: SheetView, M: THREE.Matrix4): THREE.Matrix4 {
   // độ sâu nén mạnh (kz ≪ s): mặt/đường vẫn che nhau đúng theo depth test nhưng nằm gần như phẳng — camera bản vẽ là phối cảnh nên
   // nếu để z' = −s·Y thì tấm địa hình dài vài chục ft lệch hẳn ra ngoài khung khi nhìn xiên.
   const kz = s * 0.02;
+  if (v.plan) return new THREE.Matrix4().set(s, 0, 0, a,  0, s, 0, b,  0, 0, kz, -kz * y0,  0, 0, 0, 1).multiply(M);   // mặt bằng: X,Y → giấy, Z cao = gần camera
   return new THREE.Matrix4().set(s, 0, 0, a,  0, 0, s, b,  0, -kz, 0, kz * y0,  0, 0, 0, 1).multiply(M);
 }
 
@@ -19,12 +20,13 @@ function viewMatrix(v: SheetView, M: THREE.Matrix4): THREE.Matrix4 {
 function annMatrix(v: SheetView, M: THREE.Matrix4): THREE.Matrix4 {
   const { s, a, b, y0 } = v, kz = s * 0.02, e = M.elements;
   const lin = M.clone(); lin.setPosition(0, 0, 0);
+  if (v.plan) return new THREE.Matrix4().set(1, 0, 0, 0,  0, 1, 0, 0,  0, 0, kz / s, 0,  0, 0, 0, 1).multiply(lin).setPosition(a + s * e[12], b + s * e[13], kz * (e[14] - y0));
   const A = new THREE.Matrix4().set(1, 0, 0, 0,  0, 0, 1, 0,  0, -kz / s, 0, 0,  0, 0, 0, 1).multiply(lin);
   return A.setPosition(a + s * e[12], b + s * e[14], -kz * (e[13] - y0));
 }
 
 /** Shell/đường có kích thước local < 0.5 ft là hình tính theo tỉ lệ in (xem annMatrix). */
-function isPaperSized(sh: Shell): boolean {
+function isPaperSizedShell(sh: Shell): boolean {
   const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
   for (let k = 0; k + 2 < sh.verts.length; k += 3) for (let d = 0; d < 3; d++) { const x = sh.verts[k + d]; if (x < mn[d]) mn[d] = x; if (x > mx[d]) mx[d] = x; }
   return Math.max(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]) < 0.5;
@@ -49,6 +51,51 @@ function clipPoly(pts: number[][], [x0, y0, x1, y1]: [number, number, number, nu
     if (!poly.length) break;
   }
   return poly;
+}
+
+/** Hatch chấm của sàn (mặt bằng): file KHÔNG lưu hình hatch (chỉ tham chiếu vật liệu/texture ngoài), ảnh gốc tô chấm ngẫu nhiên -> hiệu chỉnh theo ảnh:
+ *  rải chấm (đoạn dài 0.0015 ft giấy) ngẫu nhiên có hạt giống cố định trong tam giác sàn (toạ độ mô hình), ~1 chấm mỗi 0.011 × 0.011 ft giấy. */
+function stipple(P: number[][], v: SheetView, seed: number, out: number[]) {
+  const cell = 0.00012, area = Math.abs((P[1][0] - P[0][0]) * (P[2][1] - P[0][1]) - (P[2][0] - P[0][0]) * (P[1][1] - P[0][1])) / 2 * v.s * v.s;
+  let st = (seed ^ 0x9e3779b9) >>> 0;
+  const rnd = () => { st = (st + 0x6d2b79f5) >>> 0; let t = st; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  let n = area / cell; n = Math.floor(n) + (rnd() < n - Math.floor(n) ? 1 : 0);
+  for (let i = 0; i < n; i++) {
+    let u = rnd(), w = rnd();
+    if (u + w > 1) { u = 1 - u; w = 1 - w; }
+    const x = v.a + v.s * (P[0][0] + u * (P[1][0] - P[0][0]) + w * (P[2][0] - P[0][0])), y = v.b + v.s * (P[0][1] + u * (P[1][1] - P[0][1]) + w * (P[2][1] - P[0][1]));
+    const seg = clipSeg([x, y, 0], [x + 0.0015, y, 0], v.crop);
+    if (seg) out.push(...seg[0], ...seg[1]);
+  }
+}
+
+/** Sọc đen dọc của khoảng thông tầng (mặt bằng; hiệu chỉnh theo ảnh — khoảng trống giữa nhà là một tấm ở z = −0.5 ft, 6 tam giác, bbox 24..53 × −40..64):
+ *  đường thẳng đứng (theo Y) cách nhau 0.0103 ft giấy, cắt theo tam giác. */
+function stripes(P: number[][], v: SheetView, out: number[]) {
+  const pitch = 0.0103, xs = P.map(q => v.a + v.s * q[0]);
+  for (let px = Math.ceil(Math.min(...xs) / pitch) * pitch; px <= Math.max(...xs); px += pitch) {
+    const ys: number[] = [];
+    for (let j = 0; j < 3; j++) {
+      const p = P[j], q = P[(j + 1) % 3], x0 = v.a + v.s * p[0], x1 = v.a + v.s * q[0];
+      if ((x0 <= px) !== (x1 <= px) && x0 !== x1) ys.push(v.b + v.s * (p[1] + (q[1] - p[1]) * ((px - x0) / (x1 - x0))));
+    }
+    if (ys.length < 2) continue;
+    const seg = clipSeg([px, Math.min(...ys), 0], [px, Math.max(...ys), 0], v.crop);
+    if (seg) out.push(...seg[0], ...seg[1]);
+  }
+}
+
+/** Nét gạch–chấm của đường lưới (mặt bằng; hiệu chỉnh theo ảnh gốc): gạch 0.06, hở 0.012, chấm 0.008, hở 0.012 ft giấy; bắt đầu bằng gạch. */
+function dashDotSeg(p: number[], q: number[], out: number[]) {
+  const len = Math.hypot(q[0] - p[0], q[1] - p[1]);
+  if (len < 1e-9) return;
+  const pat = [0.06, 0.012, 0.008, 0.012], at = (d: number) => { const t = Math.min(1, d / len); return [p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t, p[2] + (q[2] - p[2]) * t]; };
+  let d = 0;
+  for (let i = 0; d < len; i++) {
+    const l = pat[i % 4];
+    if (i % 2 === 0) out.push(...at(d), ...at(d + l));
+    d += l;
+  }
 }
 
 /** Chia đoạn thẳng thành các nét đứt (đơn vị giấy). Bắt đầu bằng một nét. */
@@ -260,6 +307,79 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
   const { idOf, names: entities, handles } = entityIds(instances);
   const texts: TextItem[] = [];
 
+  // vùng XY của mô hình (shell lưới, không tính chú thích) — dùng để nhận ra đường lưới mang ma trận bậy trong mặt bằng
+  let planBounds: number[] | null = null;
+  const gridCols: { x: number; lo: number; hi: number }[] = [];
+  if (model.sheet && model.views?.some(w => w.plan)) {
+    const B = [Infinity, Infinity, -Infinity, -Infinity];
+    for (const ins of instances) {
+      if (ins.paper) continue;
+      const e = ins.M.elements;
+      for (const p of ins.parts) for (const sh of p.shells) {
+        if (sh.line || sh.text || isPaperSizedShell(sh)) continue;
+        for (let k = 0; k + 2 < sh.verts.length; k += 3) {
+          const x = e[0] * sh.verts[k] + e[4] * sh.verts[k + 1] + e[8] * sh.verts[k + 2] + e[12], y = e[1] * sh.verts[k] + e[5] * sh.verts[k + 1] + e[9] * sh.verts[k + 2] + e[13];
+          if (x < B[0]) B[0] = x;
+          if (y < B[1]) B[1] = y;
+          if (x > B[2]) B[2] = x;
+          if (y > B[3]) B[3] = y;
+        }
+      }
+    }
+    if (B[0] < Infinity) planBounds = B;
+    // Đường lưới dọc (đường thẳng đứng dài > 20 ft, toạ độ tuyệt đối trong vùng mô hình): khoảng Y của mỗi X
+    if (planBounds) {
+      for (const ins of instances) {
+        if (ins.paper) continue;
+        for (const p of ins.parts) for (const sh of p.shells) {
+          const vv = sh.verts;
+          if (!sh.line || sh.circle || vv.length !== 6 || Math.abs(vv[0] - vv[3]) > 1e-6 || Math.abs(vv[1] - vv[4]) < 20) continue;
+          if (vv[0] < planBounds[0] - 40 || vv[0] > planBounds[2] + 40) continue;
+          const g = gridCols.find(c => Math.abs(c.x - vv[0]) < 0.3);
+          const lo = Math.min(vv[1], vv[4]), hi = Math.max(vv[1], vv[4]);
+          if (g) { g.lo = Math.min(g.lo, lo); g.hi = Math.max(g.hi, hi); } else gridCols.push({ x: vv[0], lo, hi });
+        }
+      }
+    }
+  }
+  /** Bong bóng lưới: file chỉ lưu đầu bong bóng ở một đầu đường lưới (đầu dưới, tâm cách đầu đường 2.13 ft = bán kính vòng) nhưng ảnh gốc còn vẽ đầu trên của những đường lưới dài suốt;
+   *  vòng + chữ ở đầu dưới thì sao chép lên đầu trên của đường lưới đó (dịch theo Y). Trả về độ dịch (ft mô hình) hoặc null. */
+  const topShift = (view: SheetView, px: number, py: number, tolX: number, tolY: number): number | null => {
+    const X = (px - view.a) / view.s, Y = (py - view.b) / view.s;
+    // chỉ những đường lưới chạm tới mép trên của cả lưới (116.2 ft ở school_sheet_1: lưới 1, 1.1, 2, 3, 4, 5, 6) mới có bong bóng đầu trên; đầu dưới ở mép dưới của cả lưới
+    if (!gridCols.length) return null;
+    const lo = Math.min(...gridCols.map(g => g.lo)), hi = Math.max(...gridCols.map(g => g.hi));
+    for (const g of gridCols) if (g.hi >= hi - 1 && Math.abs(X - g.x) < tolX && Math.abs(Y - (lo - 2.13)) < tolY) return hi - lo + 4.26;
+    return null;
+  };
+
+  // Cầu thang trong mặt bằng: một đối tượng gồm ≥ 100 shell nhỏ (mỗi bậc một shell), bề ngang < 12 ft, dài < 70 ft, cao ≥ 5 ft (school_sheet_1: 219/220, 253/254, mỗi cái 180 shell).
+  // Mặt phẳng cắt chỉ cắt vài bậc, nhưng ảnh gốc vẽ MỌI bậc dưới mặt cắt -> với cầu thang vẽ thêm cạnh (theo trục) của mặt bậc nằm ngang dưới mặt cắt.
+  const stairs = new Map<number, number>();   // chỉ số instance -> độ cao thấp nhất
+  const columns: { i: number; x: number; y: number }[] = [];
+  const stairBoxes: number[][] = [];            // bbox XY (x0, y0, x1, y1) của các cầu thang
+  if (model.sheet && model.views?.some(w => w.plan)) {
+    instances.forEach((ins, i) => {
+      if (ins.paper) return;
+      const e = ins.M.elements, b = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
+      let n = 0;
+      for (const p of ins.parts) for (const sh of p.shells) {
+        if (sh.line || sh.text) continue;
+        n++;
+        for (let k = 0; k + 2 < sh.verts.length; k += 3) for (let d = 0; d < 3; d++) {
+          const w = e[d] * sh.verts[k] + e[d + 4] * sh.verts[k + 1] + e[d + 8] * sh.verts[k + 2] + e[d + 12];
+          if (w < b[d]) b[d] = w;
+          if (w > b[d + 3]) b[d + 3] = w;
+        }
+      }
+      const w = b[3] - b[0], l = b[4] - b[1], h = b[5] - b[2];
+      if (n >= 100 && Math.min(w, l) < 12 && Math.max(w, l) < 70 && h >= 5) { stairs.set(i, b[2]); stairBoxes.push([b[0], b[1], b[3], b[4]]); }
+      // cột thép chữ I (≤ 20 shell, tiết diện < 1 ft, cao ≥ 8 ft) bị mặt cắt đi qua: ảnh gốc vẽ ký hiệu = tiết diện chữ I trong một vòng tròn (vòng không có trong file)
+      const zc = model.views?.find(q => q.plan)?.y0 ?? 0;
+      if (n > 0 && n <= 20 && w < 1 && l < 1 && h >= 8 && b[2] <= zc && b[5] >= zc) columns.push({ i, x: (b[0] + b[3]) / 2, y: (b[1] + b[4]) / 2 });
+    });
+  }
+
   instances.forEach((ins, ii) => {
     // file bản vẽ: trang giấy vẽ nguyên; nội dung viewport = bản sao mô hình của view chiếu lên giấy; còn lại bỏ
     let view: SheetView | undefined, M = ins.M;
@@ -271,6 +391,17 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
     const yIn = (sh: Shell) => {   // lát cắt độ sâu: MỌI đỉnh nằm trong [y0 − ε, y0 + depth] (Y world, trước khi chiếu)
       if (!view) return true;                // (tấm địa hình/cây chỉ chạm lát bằng một đỉnh thì loại, như ảnh gốc)
       const e = (sh.textM ?? ins.M).elements, vv = sh.verts;
+      if (view.plan) {   // mặt bằng: chú thích/đường luôn giữ; mặt phải bị mặt phẳng cắt Z = y0 cắt qua
+        if (sh.line || sh.text || isPaperSized(sh)) return true;
+        let lo = Infinity, hi = -Infinity;
+        for (let k = 0; k + 2 < vv.length; k += 3) {
+          const z = e[2] * vv[k] + e[6] * vv[k + 1] + e[10] * vv[k + 2] + e[14];
+          if (z < lo) lo = z;
+          if (z > hi) hi = z;
+        }
+        if ((stairs.get(ii) ?? Infinity) <= view.y0) return true;   // cầu thang bắt đầu dưới mặt cắt: vẽ cả đoạn thang (bậc nằm trên mặt cắt cũng có, như ảnh gốc)
+        return (lo <= view.y0 && hi >= view.y0 - 0.05) || (view.hatchZ !== undefined && lo <= view.hatchZ + 0.05 && hi >= view.hatchZ - 0.05) || (view.stripeZ !== undefined && lo <= view.stripeZ + 0.05 && hi >= view.stripeZ - 0.05);   // hoặc chạm mặt sàn (rải chấm)
+      }
       if (view.slab === 'cut') {   // shell cắt qua mặt phẳng view (hoặc nằm trong lát mỏng quanh nó, như chú thích)
         let lo = Infinity, hi = -Infinity;
         for (let k = 0; k + 2 < vv.length; k += 3) {
@@ -288,6 +419,9 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
       return view.slab !== 'touch';
     };
     const Mann = view ? annMatrix(view, ins.M) : M;
+    // Mặt bằng: shell nhỏ (< 0.5 ft) chỉ là chú thích tính theo tỉ lệ in khi instance có chữ/đường; vật nhỏ thật của mô hình (0.49 ft) thì cắt như mọi thứ
+    const annot = !view?.plan || ins.parts.some(p => p.shells.some(s => s.text || s.line));
+    const isPaperSized = (sh: Shell) => annot && isPaperSizedShell(sh);
     const id = idOf[ii];
     ins.parts.forEach(part => {
       // viewport: mô hình xuất ở kiểu "hidden line" — mặt, chữ, đường đều TRẮNG (nét đen do cạnh); trên giấy trắng chữ/đường trắng sẽ vô hình,
@@ -302,11 +436,13 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
       for (const sh of part.shells) {
         if (!(sh.text?.abs) && !yIn(sh)) continue;
         if (sh.text?.abs && !view) continue;   // chữ toạ độ mô hình chỉ có nghĩa trong viewport
-        if (sh.text?.abs && view) {
+        // mặt bằng: chữ cao > 0.05 ft là chữ TÍNH THEO ĐƠN VỊ MÔ HÌNH (số đo của dây kích thước "7315", ghi chú "Exterior overhead canopy…": cao 0.82 ft = 2.5 mm × 100) — chiếu có nhân tỉ lệ s
+        const modelText = !!sh.text && !!view?.plan && !sh.text.abs && sh.text.h > 0.05;
+        if (sh.text && (sh.text.abs || modelText) && view) {
           // nhãn level thứ cấp: x = X, y = Z (toạ độ mô hình), cao chữ theo đơn vị mô hình -> chiếu có nhân tỉ lệ s, trục chữ = trục giấy
           const px = view.a + view.s * sh.verts[0], py = view.b + view.s * sh.verts[1];
           if (px < view.crop[0] || px > view.crop[2] || py < view.crop[1] || py > view.crop[3]) continue;
-          texts.push({ entity: id, color: lineInk || color, text: sh.text.s, height: sh.text.h * view.s, origin: [px, py, 0], ax: [1, 0, 0], ay: [0, 1, 0] });
+          texts.push({ entity: id, color: lineInk || color, text: sh.text.s, height: sh.text.h * view.s, origin: [px, py, 0], ax: [Math.cos(sh.text.rot), Math.sin(sh.text.rot), 0], ay: [-Math.sin(sh.text.rot), Math.cos(sh.text.rot), 0] });
           continue;
         }
         if (sh.text) {   // chữ: đưa ra danh sách riêng (dựng bằng texture canvas ở main thread)
@@ -319,6 +455,11 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
             const px = e[0] * x + e[4] * y + e[12], py = e[1] * x + e[5] * y + e[13];
             if (px < view.crop[0] || px > view.crop[2] || py < view.crop[1] || py > view.crop[3]) continue;
           }
+          const dupY = view?.plan ? topShift(view, e[0] * x + e[4] * y + e[12], e[1] * x + e[5] * y + e[13], 2.5, 1.5) : null;
+          if (dupY !== null && view) {
+            const oy = e[1] * x + e[5] * y + e[13] + view.s * dupY;
+            if (oy <= view.crop[3]) texts.push({ entity: id, color: lineInk || color, text: sh.text.s, height: sh.text.h * sy, origin: [e[0] * x + e[4] * y + e[12], oy, 0], ax: ax.clone().normalize().toArray() as [number, number, number], ay: ay.clone().normalize().toArray() as [number, number, number] });
+          }
           texts.push({
             entity: id, color: lineInk || (labelInk && sh.text.s.length > 3 && !sh.text.s.includes(':') ? labelInk : color), text: sh.text.s, height: sh.text.h * sy,
             origin: [e[0] * x + e[4] * y + e[12], e[1] * x + e[5] * y + e[13], e[2] * x + e[6] * y + e[14]],
@@ -329,7 +470,32 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
         if (sh.line) {   // đường gấp khúc: các đoạn nối tiếp giữa điểm k và k+1, áp ma trận instance
           const w = buckets.wire, vv = sh.verts;
           let Ml = view && isPaperSized(sh) ? Mann : M;
-          if (view && Ml === M) {
+          let gridLine = false, leader = false;
+          if (view?.plan && Ml === M && planBounds) {
+            // Đường lưới của mặt bằng: toạ độ local đã là toạ độ mô hình tuyệt đối nhưng instance mang ma trận bậy (dời 180.6, −52.2, 7.1 và lật) -> văng ra ngoài
+            // vùng mô hình. Nếu áp ma trận làm đường rơi khỏi vùng (± 40 ft) mà bỏ ma trận thì nằm trong -> bỏ ma trận (như đường level của mặt đứng).
+            const inside = (mat: THREE.Matrix4) => {
+              const e = mat.elements, vv = sh.verts;
+              for (let k = 0; k + 2 < vv.length; k += 3) {
+                const x = e[0] * vv[k] + e[4] * vv[k + 1] + e[8] * vv[k + 2] + e[12], y = e[1] * vv[k] + e[5] * vv[k + 1] + e[9] * vv[k + 2] + e[13];
+                if (x < planBounds[0] - 40 || x > planBounds[2] + 40 || y < planBounds[1] - 40 || y > planBounds[3] + 40) return false;
+              }
+              return true;
+            };
+            let len = 0;
+            for (let k = 0; k + 5 < sh.verts.length; k += 3) len += Math.hypot(sh.verts[k + 3] - sh.verts[k], sh.verts[k + 4] - sh.verts[k + 1]);
+            // đường dài (> 20 ft) đã nằm trong vùng mô hình với ma trận đơn vị: đường lưới — một số mảnh vẫn rơi vào vùng sau khi áp ma trận bậy nên kiểm "rơi ngoài" là chưa đủ
+            // đường ngắn nhưng toạ độ local đã ở xa gốc (> 20 ft: tay dẫn ghi chú "Exterior overhead canopy" — 3 điểm, dài 18 ft) trong instance mang ma trận bậy cũng là toạ độ tuyệt đối;
+            // đường quanh gốc (cánh cửa: local ±3 ft) thì ma trận là thật
+            const cx = (Math.min(sh.verts[0], sh.verts[sh.verts.length - 3]) + Math.max(sh.verts[0], sh.verts[sh.verts.length - 3])) / 2, cy = (sh.verts[1] + sh.verts[sh.verts.length - 2]) / 2;
+            const absolute = Math.hypot(cx, cy) > 20 && (Math.abs(ins.M.elements[12]) > 20 || Math.abs(ins.M.elements[13]) > 20);
+            if (inside(new THREE.Matrix4()) && (!inside(ins.M) || len > 20 || absolute)) {
+              Ml = viewMatrix(view, new THREE.Matrix4());
+              gridLine = len > 20 && ins.M.elements.some((x, i) => Math.abs(x - (i % 5 === 0 ? 1 : 0)) > 1e-9);
+              leader = !gridLine && absolute && vv.length === 9;   // đường lưới mang ma trận bậy; dây kích thước (ma trận đơn vị) thì liền nét
+            }
+          }
+          if (view && !view.plan && Ml === M) {
             // Đường level của view (instance chung với đầu level): toạ độ đã là TOẠ ĐỘ MÔ HÌNH tuyệt đối (x, y0, 0) nhưng ma trận
             // của đầu level (dời 95.8, y0, 0 và xoay) vẫn bị áp -> rơi xuống z = y0 ≈ −62 ft, ra ngoài khung. Nếu áp ma trận làm đường
             // văng khỏi dải cao độ của mô hình (z ∉ [−30, 60] ft) mà dùng ma trận đơn vị thì vào dải đó -> dùng ma trận đơn vị.
@@ -345,7 +511,14 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
           // Nét đứt (hiệu chỉnh theo ảnh gốc): đường lưới và đường level nằm ĐÚNG trên mặt phẳng view (Y = y0) và dài > 5 ft; file không lưu kiểu nét
           // trong bản ghi đường (cờ màu cb/04 hay 80/02 đều giống đường liền) nên chưa đọc được từ dữ liệu.
           let dashed = false;
-          if (view && !sh.circle) {
+          if (view?.plan && !sh.circle && vv.length === 6 && !gridLine && !leader) {
+            // khung chạy thang (đường mô hình liền quanh thang, lớn hơn bậc ~ 2 ft mỗi bên): ảnh gốc vẽ nét đứt mảnh (file không lưu kiểu nét)
+            const mat = Ml.elements, X = (k: number) => mat[0] * vv[k] + mat[4] * vv[k + 1] + mat[8] * vv[k + 2] + mat[12], Y = (k: number) => mat[1] * vv[k] + mat[5] * vv[k + 1] + mat[9] * vv[k + 2] + mat[13];
+            const x0 = (X(0) - view.a) / view.s, y0 = (Y(0) - view.b) / view.s, x1 = (X(3) - view.a) / view.s, y1 = (Y(3) - view.b) / view.s;
+            if (stairBoxes.some(q => Math.min(x0, x1) >= q[0] - 2.6 && Math.max(x0, x1) <= q[2] + 2.6 && Math.min(y0, y1) >= q[1] - 2.6 && Math.max(y0, y1) <= q[3] + 2.6 && Math.hypot(x1 - x0, y1 - y0) > 3 && (Math.abs(x1 - x0) < 1e-3 || Math.abs(y1 - y0) < 1e-3)))
+              { for (let k = 0; k + 5 < vv.length; k += 3) { const q0 = [X(k), Y(k), 0], q1 = [X(k + 3), Y(k + 3), 0], sg = clipSeg(q0, q1, view.crop); if (sg) dashSeg(sg[0], sg[1], 0.012, 0.009, w); } continue; }
+          }
+          if (view && !view.plan && !sh.circle) {
             let lo = Infinity, hi = -Infinity, len = 0;
             const e = Ml === Mann ? Mann.elements : ins.M.elements;
             for (let k = 0; k + 2 < vv.length; k += 3) {
@@ -362,7 +535,28 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
             v.set(vv[k + 3], vv[k + 4], vv[k + 5]).applyMatrix4(Ml);
             const p1 = [v.x, v.y, v.z];
             const seg = view ? clipSeg(p0, p1, view.crop) : [p0, p1];
-            if (seg) { if (dashed) dashSeg(seg[0], seg[1], 0.03, 0.012, w); else w.push(...seg[0], ...seg[1]); }
+            if (seg) { if (gridLine) dashDotSeg(seg[0], seg[1], w); else if (dashed) dashSeg(seg[0], seg[1], 0.03, 0.012, w); else w.push(...seg[0], ...seg[1]); }
+          }
+          if (leader) {   // tay dẫn ghi chú: đầu mũi tên mở (file không lưu mũi tên — hiệu chỉnh theo ảnh: dài 1.8 ft mô hình, mở ±10° so với đường dẫn)
+            const dx = vv[6] - vv[3], dy = vv[7] - vv[4], d = Math.hypot(dx, dy) || 1, ux = dx / d, uy = dy / d, A = 1.8, th = (10 * Math.PI) / 180;
+            for (const sg of [-1, 1]) {
+              const c = Math.cos(th), sn = Math.sin(sg * th), wx = vv[6] - A * (ux * c - uy * sn), wy = vv[7] - A * (ux * sn + uy * c);
+              v.set(vv[6], vv[7], vv[8]).applyMatrix4(Ml);
+              const t0 = [v.x, v.y, v.z];
+              v.set(wx, wy, vv[8]).applyMatrix4(Ml);
+              const sg2 = clipSeg(t0, [v.x, v.y, v.z], view!.crop);
+              if (sg2) w.push(...sg2[0], ...sg2[1]);
+            }
+          }
+          if (view?.plan && sh.circle) {
+            const cc = new THREE.Vector3(sh.circle.c[0], sh.circle.c[1], sh.circle.c[2]).applyMatrix4(Ml), dy = topShift(view, cc.x, cc.y, 0.5, 0.6);
+            if (dy !== null) for (let k = 0; k + 5 < vv.length; k += 3) {
+              v.set(vv[k], vv[k + 1], vv[k + 2]).applyMatrix4(Ml);
+              const q0 = [v.x, v.y + view.s * dy, v.z];
+              v.set(vv[k + 3], vv[k + 4], vv[k + 5]).applyMatrix4(Ml);
+              const sg = clipSeg(q0, [v.x, v.y + view.s * dy, v.z], view.crop);
+              if (sg) w.push(...sg[0], ...sg[1]);
+            }
           }
           continue;
         }
@@ -370,6 +564,35 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
         const faceColors = debugColors ? null : sh.faceColors;
         const tri = triangulateShell(sh), out = buckets[faceColors ? 'faceCol' : glass ? 'glass' : 'opaque'];
         const triFace = sh.triFace ?? [];
+        if (view?.plan && !isPaperSized(sh)) {
+          // Mặt bằng: không chiếu mặt đứng (suy biến thành vệt) mà lấy GIAO của từng tam giác với mặt phẳng cắt Z = y0 -> các đoạn thẳng (đường cắt tường/cột…)
+          const w = buckets.wire, e = ins.M.elements, z0 = view.y0;
+          const W = (vi: number) => {
+            const x = sh.verts[vi * 3], y = sh.verts[vi * 3 + 1], z = sh.verts[vi * 3 + 2];
+            return [e[0] * x + e[4] * y + e[8] * z + e[12], e[1] * x + e[5] * y + e[9] * z + e[13], e[2] * x + e[6] * y + e[10] * z + e[14]];
+          };
+          for (let k = 0; k + 2 < tri.length; k += 3) {
+            const P = [W(tri[k]), W(tri[k + 1]), W(tri[k + 2])], hit: number[][] = [];
+            for (let j = 0; j < 3; j++) {
+              const p = P[j], q = P[(j + 1) % 3], dp = p[2] - z0, dq = q[2] - z0;
+              if ((dp < 0) !== (dq < 0) && dp !== dq) { const t = dp / (dp - dq); hit.push([p[0] + (q[0] - p[0]) * t, p[1] + (q[1] - p[1]) * t]); }
+            }
+            if ((stairs.get(ii) ?? Infinity) <= view.y0 && Math.min(Math.max(...P.map(q => q[0])) - Math.min(...P.map(q => q[0])), Math.max(...P.map(q => q[1])) - Math.min(...P.map(q => q[1]))) < 0.5) {   // tam giác có hình chiếu mỏng (< 0.5 ft: mặt bậc, mặt đứng của thanh cạnh/lan can — nét dày hai bên ảnh gốc; bỏ mặt đế lớn): các cạnh theo trục
+              for (let j = 0; j < 3; j++) {
+                const p = P[j], q = P[(j + 1) % 3];
+                if (Math.abs(p[0] - q[0]) > 1e-6 && Math.abs(p[1] - q[1]) > 1e-6) continue;
+                const sg = clipSeg([view.a + view.s * p[0], view.b + view.s * p[1], 0], [view.a + view.s * q[0], view.b + view.s * q[1], 0], view.crop);
+                if (sg) w.push(...sg[0], ...sg[1]);
+              }
+            }
+            if (view.stripeZ !== undefined && P.every(q => Math.abs(q[2] - view.stripeZ!) < 0.05)) stripes(P, view, w);
+            if (view.hatchZ !== undefined && P.every(q => Math.abs(q[2] - view.hatchZ!) < 0.05)) stipple(P, view, (ii * 7919 + k) | 0, w);
+            if (hit.length !== 2) continue;
+            const seg = clipSeg([view.a + view.s * hit[0][0], view.b + view.s * hit[0][1], 0], [view.a + view.s * hit[1][0], view.b + view.s * hit[1][1], 0], view.crop);
+            if (seg) w.push(...seg[0], ...seg[1]);
+          }
+          continue;
+        }
         if (view) {   // viewport: chiếu rồi cắt từng tam giác theo khung (đa giác → quạt tam giác)
           const Ms = isPaperSized(sh) ? Mann : M;
           for (let k = 0; k + 2 < tri.length; k += 3) {
@@ -432,10 +655,30 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
     });
   });
 
+  // Vòng tròn quanh tiết diện cột chữ I (mặt bằng): bán kính 0.75 ft mô hình, hiệu chỉnh theo ảnh (đường kính vòng ≈ 2× cạnh chữ I)
+  if (columns.length) {
+    const view = model.views!.find(q => q.plan)!, SEG = 24, key = 'wire:' + 0x0a0a0a;
+    for (const c of columns) {
+      const seg: number[] = [];
+      for (let k = 0; k < SEG; k++) {
+        const a0 = (k / SEG) * 2 * Math.PI, a1 = ((k + 1) / SEG) * 2 * Math.PI;
+        const sg = clipSeg([view.a + view.s * (c.x + 0.75 * Math.cos(a0)), view.b + view.s * (c.y + 0.75 * Math.sin(a0)), 0], [view.a + view.s * (c.x + 0.75 * Math.cos(a1)), view.b + view.s * (c.y + 0.75 * Math.sin(a1)), 0], view.crop);
+        if (sg) seg.push(...sg[0], ...sg[1]);
+      }
+      if (!seg.length) continue;
+      const arr = new Float32Array(seg);
+      let acc = accs.get(key);
+      if (!acc) accs.set(key, acc = { kind: 'wire', color: 0x0a0a0a, opacity: -1, pos: [], nor: [], col: [], edg: [], ranges: [], vCount: 0, eCount: 0 });
+      acc.ranges.push(idOf[c.i], acc.vCount, 0, acc.eCount, arr.length / 3);
+      acc.edg.push(arr);
+      acc.eCount += arr.length / 3;
+    }
+  }
+
   // Hatch gạch của mặt cắt địa hình trong từng viewport (vẽ như đường đen, thuộc đối tượng đầu tiên của view)
   if (model.sheet && model.views) {
     for (const view of model.views) {
-      const cut = terrainCut(view, instances);
+      const cut = view.plan ? null : terrainCut(view, instances);
       if (!cut) continue;
       const raw: number[] = [];
       hatchSegments(view, cut, raw);
@@ -464,7 +707,7 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
     edges: concat(a.edg, a.eCount * 3),
     ranges: new Uint32Array(a.ranges),
   }));
-  return { chunks, entities, handles, texts, sheet: !!model.sheet };
+  return { chunks, entities, handles, texts, sheet: !!model.sheet, plan: !!model.plan };
 }
 
 /** Danh sách ArrayBuffer cần chuyển giao (transfer) khi gửi MeshData qua postMessage. */

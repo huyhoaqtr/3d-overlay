@@ -303,7 +303,7 @@ const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
         c.world.position.sub(center);
         const r = Math.max(size.x, size.y, size.z) || 1;
         // file bản vẽ (sheet): nhìn thẳng từ trên xuống, trục Y của giấy hướng lên màn hình (y file = −z Three)
-        if (l.data.sheet) { c.camera.position.set(0, r * 1.1, r * 0.002); setSheetControls(c, true); }
+        if (l.data.sheet || l.data.plan) { c.camera.position.set(0, r * 1.1, r * 0.002); setSheetControls(c, true); }
         else c.camera.position.set(r * .55, r * .75, r * .75);
         c.camera.near = r / 2000;
         c.camera.far = r * 50;

@@ -110,10 +110,35 @@ export function scanShells(raw: Uint8Array): Shell[] {
  * kiểu = 05 thay vì 08:  05 00 00 00 00 0C 00 [cờ] [cờ2] 00 | u32 cnt | cnt × (x,y,z f64), KHÔNG có face list (hết là sang bản ghi
  * kế). Màu nằm trong bản ghi `0D 04|06 00 00 [f1 f2] 00 [B G R] C2` ngay trước (file_5.vsfx: 1 759 đường 2 điểm, xanh/cam/olive
  * như viewer gốc). Chỉ nhận khi có bản ghi màu đó phía trước, để khỏi nhầm với byte 05 ngẫu nhiên. Suy luận, chưa có spec. */
-export function scanLines(raw: Uint8Array): Shell[] {
+export function scanLines(raw: Uint8Array, lenient = false): Shell[] {
   const L = raw.length, { f64, u32 } = views(raw), lines: Shell[] = [];
+  const pushLine = (s: number, cnt: number, color?: number): number => {
+    const v = new Float64Array(cnt * 3);
+    for (let i = 0; i < cnt * 3; i++) {
+      const x = f64(s + i * 8);
+      if (!Number.isFinite(x) || Math.abs(x) > 1e7) return -1;
+      v[i] = x;
+    }
+    lines.push({ off: s, end: s + cnt * 24, verts: v, faces: new Int32Array(0), faceColors: null, line: true, color });
+    return s + cnt * 24 - 1;
+  };
   for (let o = 0; o + 14 <= L; o++) {
-    if (raw[o] !== 5 || raw[o + 1] || raw[o + 2] || raw[o + 3] || raw[o + 4]) continue;
+    // Biến thể CÓ KHỐI THUỘC TÍNH (khung tên/khung giấy của school_sheet_1: ~40 đường): `05 00 00 04 10 00 [handle…] … 20 00 00 00 01 00 [B G R] C2 00 | 0C 00 cờ cờ2 00 | cnt`
+    // (giống biến thể header shell của school.vsfx). Màu ngay trước C2; 000000 = đen. Tìm `0C` trong 60 byte sau.
+    if (raw[o] === 5 && !raw[o + 1] && !raw[o + 2] && raw[o + 3] === 4 && raw[o + 4] === 0x10 && !raw[o + 5]) {
+      let hit = -1;
+      for (let h = o + 6; h < o + 60 && h + 9 < L; h++) {
+        if (raw[h] !== 0x0c || raw[h + 1] || raw[h + 3] > 1 || raw[h + 4] || raw[h - 2] !== 0xc2) continue;
+        const cnt = u32(h + 5);
+        if (cnt >= 2 && cnt <= 100000 && h + 9 + cnt * 24 <= L) { hit = h; break; }
+      }
+      if (hit >= 0) {
+        const cnt = u32(hit + 5), color = (raw[hit - 3] << 16) | (raw[hit - 4] << 8) | raw[hit - 5];
+        const e = pushLine(hit + 9, cnt, color);
+        if (e >= 0) { o = e; continue; }
+      }
+    }
+    if ((raw[o] !== 5 && raw[o] !== 0x20) || raw[o + 1] || raw[o + 2] || raw[o + 3] || raw[o + 4]) continue;   // 20 = đường có kiểu nét/độ dày riêng (school_sheet_1: 494, school.vsfx: 454 — trước đây bị bỏ sót)
     const h = o + 5;
     if (raw[h] !== 0x0c || raw[h + 1] || raw[h + 3] > 1 || raw[h + 4]) continue;
     const cnt = u32(h + 5), s = h + 9;
@@ -121,7 +146,7 @@ export function scanLines(raw: Uint8Array): Shell[] {
     let hasColor = false;
     for (let q = h - 1; q >= Math.max(0, h - 60) && !hasColor; q--)
       hasColor = raw[q] === 0x0d && (raw[q + 1] === 4 || raw[q + 1] === 6) && !raw[q + 2] && !raw[q + 3] && !raw[q + 6] && (raw[q + 10] === 0xc2 || raw[q + 10] === 0xc0);   // C0 = ByLayer (không màu riêng)
-    if (!hasColor) continue;
+    if (!hasColor && !lenient) continue;   // lenient (file bản vẽ): đường không có bản ghi màu — đường lưới, dây kích thước… — vẫn nhận (ByLayer)
     const v = new Float64Array(cnt * 3);
     let ok = true;
     for (let i = 0; i < cnt * 3; i++) {
@@ -130,6 +155,11 @@ export function scanLines(raw: Uint8Array): Shell[] {
       v[i] = x;
     }
     if (!ok) continue;
+    if (!hasColor) {   // chỉ giữ đường dài (> 5 ft: đường lưới / dây kích thước theo toạ độ mô hình); đường ngắn không màu hay rơi vào khổ giấy và bị coi là trang giấy
+      let len = 0;
+      for (let i = 0; i + 5 < v.length; i += 3) len += Math.hypot(v[i + 3] - v[i], v[i + 4] - v[i + 1], v[i + 5] - v[i + 2]);
+      if (len <= 5) continue;
+    }
     lines.push({ off: s, end: s + cnt * 24, verts: v, faces: new Int32Array(0), faceColors: null, line: true });
     o = s + cnt * 24 - 1;
   }
@@ -143,10 +173,13 @@ export function scanLines(raw: Uint8Array): Shell[] {
 export function scanCircles(raw: Uint8Array): Shell[] {
   const L = raw.length, { f64 } = views(raw), out: Shell[] = [];
   const SEG = 32;
-  for (let o = 4; o + 43 <= L; o++) {
-    if (raw[o - 4] !== 1 || raw[o - 3] || raw[o - 2] || raw[o - 1] || raw[o] || raw[o + 1] || raw[o + 2] || raw[o + 3] || raw[o + 4] ||
-        raw[o + 5] !== 0x0c || raw[o + 6] || raw[o + 7] || raw[o + 8] || raw[o + 9]) continue;
-    const c = o + 10, cx = f64(c), cy = f64(c + 8), cz = f64(c + 16), r = f64(c + 24);
+  for (let o = 12; o + 43 <= L; o++) {
+    // Biến thể có khối thuộc tính (school_sheet_1: bong bóng lưới): `01 08 00 14 | 00×8 | 0C 00 00 00 00 | tâm | bán kính`
+    const attr = raw[o] === 0x0c && !raw[o + 1] && !raw[o + 2] && !raw[o + 3] && !raw[o + 4] && raw[o - 12] === 1 && raw[o - 11] === 8 && !raw[o - 10] && raw[o - 9] === 0x14 &&
+      [1, 2, 3, 4, 5, 6, 7, 8].every(k => !raw[o - k]);
+    if (!attr && (raw[o - 4] !== 1 || raw[o - 3] || raw[o - 2] || raw[o - 1] || raw[o] || raw[o + 1] || raw[o + 2] || raw[o + 3] || raw[o + 4] ||
+        raw[o + 5] !== 0x0c || raw[o + 6] || raw[o + 7] || raw[o + 8] || raw[o + 9])) continue;
+    const c = attr ? o + 5 : o + 10, cx = f64(c), cy = f64(c + 8), cz = f64(c + 16), r = f64(c + 24);
     if (![cx, cy, cz, r].every(Number.isFinite) || !(r > 1e-4 && r < 1e3) || Math.abs(cx) > 1e5 || Math.abs(cy) > 1e5 || Math.abs(cz) > 1e5) continue;
     const v = new Float64Array((SEG + 1) * 3);
     for (let i = 0; i <= SEG; i++) {
