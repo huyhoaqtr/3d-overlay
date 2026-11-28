@@ -283,11 +283,14 @@ export class SceneModel {
 
   /** Tạo index buffer (0, 1, 2, …) cho mặt và cạnh của batch khi cần lần đầu (ẩn/hiện, BVH). Dựng không index nhìn y hệt dựng với index đồng nhất. */
   private ensureIndex(b: Batch) {
-    if (b.vIndex) return;
-    b.vIndex = iota((b.posQ ?? b.positions).length / 3);
-    b.mesh.geometry.setIndex(new THREE.BufferAttribute(b.vIndex, 1));
-    b.eIndex = iota((b.edgeQ ?? b.edgePositions).length / 3);
-    b.lines.geometry.setIndex(new THREE.BufferAttribute(b.eIndex, 1));
+    if (!b.vIndex) {
+      b.vIndex = iota((b.posQ ?? b.positions).length / 3);
+      b.mesh.geometry.setIndex(new THREE.BufferAttribute(b.vIndex, 1));
+    }
+    if (!b.eIndex) {
+      b.eIndex = iota((b.edgeQ ?? b.edgePositions).length / 3);
+      b.lines.geometry.setIndex(new THREE.BufferAttribute(b.eIndex, 1));
+    }
   }
 
   private mask(entity: number, visible: boolean) {
@@ -323,8 +326,9 @@ export class SceneModel {
   /** Dựng BVH (indirect: không đảo index buffer, nên bảng range vẫn đúng) cho batch chưa có. */
   private buildBvh(b: Batch) {
     if (b.bvh || b.kind === 'wire') return;
-    this.ensureIndex(b);
-    (b.mesh.geometry as THREE.BufferGeometry & { computeBoundsTree(o?: object): void }).computeBoundsTree({ indirect: true });
+    // Không tạo index ở đây (92 MB với file_14): BVH không cần; nếu sau này ẩn/hiện mới tạo index đồng nhất — cùng ánh xạ tam giác -> đỉnh nên BVH vẫn đúng.
+    // Lá lớn hơn (30 tam giác, mặc định ~10): cây nhỏ ~3×, chọn chậm hơn không đáng kể.
+    (b.mesh.geometry as THREE.BufferGeometry & { computeBoundsTree(o?: object): void }).computeBoundsTree({ indirect: true, targetLeafSize: 30 });
     b.bvh = true;
   }
 
