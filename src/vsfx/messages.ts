@@ -12,3 +12,13 @@ export type WorkerResponse =
   | { type: 'loaded'; id: number; summary: ModelSummary }
   | { type: 'built'; id: number; data: MeshData }
   | { type: 'error'; id: number; message: string };
+
+/** Việc giao cho worker phụ dựng một lát instance (dựng lưới song song). M = 16 số của Matrix4 (mất prototype khi sao chép). */
+export interface SliceJob {
+  id: number;
+  instances: (Omit<import('./types').Instance, 'M'> & { M: number[] })[];
+  unitMM: number;
+  options: BuildOptions;
+  base: number;
+  idOf: number[];
+}

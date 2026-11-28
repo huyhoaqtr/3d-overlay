@@ -1,7 +1,7 @@
 /* Dựng lưới (chạy trong worker): triangulate thủ công, áp ma trận instance, gộp theo màu/loại,
  * tính normal và cạnh. Kết quả là các mảng Float32Array thuần để chuyển giao về main thread. */
 import * as THREE from 'three';
-import { pruneCoplanarEdges } from './edges';
+import { edgesFromTriangles, pruneCoplanarEdgesFast } from './edges';
 import type { BuildOptions, ChunkKind, MeshChunk, MeshData, SheetView, Shell, TextItem, VsfxModel } from './types';
 
 /** Viewport: ma trận mô hình -> giấy (nhìn theo +Y từ phía nam: X→x, Z→y, tỉ lệ s, dời (a, b));
@@ -245,6 +245,11 @@ export function triangulateShell(sh: Shell): number[] {
 
 /* Kính: file không lưu transparency, nên nhận diện theo heuristic:
  * màu xanh (B > R + 40) VÀ tấm mỏng (chiều nhỏ nhất ≤ 30 mm, chiều thứ hai ≥ 200 mm). */
+/** Cạnh của lưới tam giác rời = EdgesGeometry (góc 25°) rồi lọc cạnh thừa do T-junction; kết quả giống từng số với bản dùng THREE.EdgesGeometry + pruneCoplanarEdges (đã so trên hàng nghìn shell). */
+export function edgesPruned(pos: Float32Array): Float32Array {
+  return pruneCoplanarEdgesFast(pos, edgesFromTriangles(pos, 25).all);
+}
+
 export function isGlass(color: number, sh: Shell, unitMM = 1): boolean {
   const r = color >> 16 & 255, g = color >> 8 & 255, b = color & 255;
   // xanh rõ (B > R + 40), hoặc kính nhạt ngả cyan (G, B đều > R: fbffff của mặt bàn kính #110 trong file_13, dae3e0 — gần trắng nên B − R chỉ 4–6)
@@ -301,11 +306,14 @@ export function entityIds(instances: VsfxModel['instances']): { idOf: number[]; 
   return { idOf, names, handles };
 }
 
-export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }: BuildOptions): MeshData {
+/** `slice`: dựng lưới cho MỘT LÁT liên tiếp của danh sách instance (dựng song song nhiều worker): `base` = chỉ số toàn cục của instance đầu lát, `idOf` = bảng id đối tượng TOÀN CỤC
+ *  (tính một lần từ cả danh sách instance). Chỉ dùng cho model thường (không phải bản vẽ). */
+export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }: BuildOptions, slice?: { base: number; idOf: number[] }): MeshData {
   const { instances, unitMM } = model;
   const accs = new Map<string, Acc>();
   const v = new THREE.Vector3(), c3 = new THREE.Color();
-  const { idOf, names: entities, handles } = entityIds(instances);
+  const { idOf, names: entities, handles } = slice ? { idOf: slice.idOf, names: [] as string[], handles: [] as string[] } : entityIds(instances);
+  const base = slice?.base ?? 0;
   const texts: TextItem[] = [];
 
   // vùng XY của mô hình (shell lưới, không tính chú thích) — dùng để nhận ra đường lưới mang ma trận bậy trong mặt bằng
@@ -381,7 +389,8 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
     });
   }
 
-  instances.forEach((ins, ii) => {
+  instances.forEach((ins, li) => {
+    const ii = li + base;
     // file bản vẽ: trang giấy vẽ nguyên; nội dung viewport = bản sao mô hình của view chiếu lên giấy; còn lại bỏ
     let view: SheetView | undefined, M = ins.M;
     if (model.sheet && !ins.paper) {
@@ -614,9 +623,11 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
         // IfcSite (mặt đất) thường CÙNG độ cao với mặt trên sàn nhà (file_13: ground z = 0, IfcSlab sàn z −300…0) -> hai mặt đồng phẳng, depth test z-fight: khi xoay/zoom sàn lẫn màu xanh của đất.
         // Hạ mặt đất xuống 20 mm (đổi ra đơn vị file) — dưới ngưỡng nhìn thấy nhưng đủ để vượt sai số độ sâu.
         const dz = ins.name.endsWith('::IfcSite') ? 20 / unitMM : 0;
+        const me = M.elements;
         tri.forEach((vi, k) => {
-          v.set(sh.verts[vi * 3], sh.verts[vi * 3 + 1], sh.verts[vi * 3 + 2]).applyMatrix4(M);
-          out.push(v.x, v.y, v.z - dz);
+          const x = sh.verts[vi * 3], y = sh.verts[vi * 3 + 1], z = sh.verts[vi * 3 + 2];
+          // = Vector3.applyMatrix4 (hàng cuối ma trận afin là 0 0 0 1 nên w = 1): bỏ cấp phát/lời gọi cho mỗi đỉnh
+          out.push(me[0] * x + me[4] * y + me[8] * z + me[12], me[1] * x + me[5] * y + me[9] * z + me[13], me[2] * x + me[6] * y + me[10] * z + me[14] - dz);
           if (faceColors) {
             const fc = faceColors[triFace[(k / 3) | 0]];
             c3.setHex(fc ?? color, THREE.SRGBColorSpace);
@@ -650,11 +661,8 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
           let a = 0, tot = 0;
           for (const b of sp) {
             if (b > a) {
-              const sub = positions.subarray(a, b), gs = new THREE.BufferGeometry();
-              gs.setAttribute('position', new THREE.BufferAttribute(sub, 3));
-              const eg = new THREE.EdgesGeometry(gs, 25), ea = eg.getAttribute('position').array as Float32Array, pe = sub.length / 9 > 20000 ? ea : pruneCoplanarEdges(sub, ea);   // shell > 20 000 tam giác (mặt cong hữu cơ): bỏ lọc T-junction cho nhanh
+              const sub = positions.subarray(a, b), pe = sub.length / 9 > 20000 ? edgesFromTriangles(sub, 25).all : edgesPruned(sub);   // shell > 20 000 tam giác (mặt cong hữu cơ): bỏ lọc T-junction cho nhanh
               pieces.push(pe); tot += pe.length;
-              gs.dispose(); eg.dispose();
             }
             a = b;
           }
@@ -662,9 +670,7 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
           let o2 = 0;
           for (const pe of pieces) { edges.set(pe, o2); o2 += pe.length; }
         } else {
-          const edgesGeo0 = new THREE.EdgesGeometry(g, 25);
-          edges = pruneCoplanarEdges(positions, edgesGeo0.getAttribute('position').array as Float32Array);
-          edgesGeo0.dispose();
+          edges = edgesPruned(positions);
         }
         const op = kind === 'glass' ? alpha : -1;
         const key = kind === 'faceCol' ? kind : `${kind}:${color}:${op}`;
@@ -744,4 +750,38 @@ export function meshDataTransferables(data: MeshData): ArrayBuffer[] {
   for (const c of data.chunks)
     for (const a of [c.positions, c.normals, c.colors, c.edges, c.ranges]) if (a) out.add(a.buffer as ArrayBuffer);
   return [...out];
+}
+
+/** Ghép MeshData của các lát liên tiếp (theo thứ tự instance) thành một: cùng khoá (loại, màu, độ đục) thì nối mảng và dời `ranges` (vStart, eStart) — kết quả giống từng số với dựng tuần tự,
+ *  vì chunk mới xuất hiện theo thứ tự lát (lát đứng trước chứa các instance đứng trước) và trong chunk các range vẫn theo thứ tự instance. */
+export function mergeMeshData(parts: MeshData[], entities: string[], handles: string[]): MeshData {
+  const byKey = new Map<string, MeshChunk[]>();
+  for (const d of parts) for (const c of d.chunks) {
+    const k = `${c.kind}|${c.color}|${c.opacity}`;
+    const l = byKey.get(k);
+    if (l) l.push(c); else byKey.set(k, [c]);
+  }
+  const chunks: MeshChunk[] = [];
+  for (const list of byKey.values()) {
+    if (list.length === 1) { chunks.push(list[0]); continue; }
+    let nP = 0, nN = 0, nE = 0, nR = 0, nC = 0;
+    for (const c of list) { nP += c.positions.length; nN += c.normals.length; nE += c.edges.length; nR += c.ranges.length; if (c.colors) nC += c.colors.length; }
+    const positions = new Float32Array(nP), normals = new Float32Array(nN), edges = new Float32Array(nE), ranges = new Uint32Array(nR), colors = list[0].colors ? new Float32Array(nC) : null;
+    let oP = 0, oN = 0, oE = 0, oR = 0, oC = 0;
+    for (const c of list) {
+      const vOff = oP / 3, eOff = oE / 3;
+      positions.set(c.positions, oP); normals.set(c.normals, oN); edges.set(c.edges, oE);
+      if (colors && c.colors) { colors.set(c.colors, oC); oC += c.colors.length; }
+      for (let r = 0; r < c.ranges.length; r += 5) {
+        ranges[oR + r] = c.ranges[r];
+        ranges[oR + r + 1] = c.ranges[r + 1] + vOff;
+        ranges[oR + r + 2] = c.ranges[r + 2];
+        ranges[oR + r + 3] = c.ranges[r + 3] + eOff;
+        ranges[oR + r + 4] = c.ranges[r + 4];
+      }
+      oP += c.positions.length; oN += c.normals.length; oE += c.edges.length; oR += c.ranges.length;
+    }
+    chunks.push({ kind: list[0].kind, color: list[0].color, opacity: list[0].opacity, positions, normals, colors, edges, ranges });
+  }
+  return { chunks, entities, handles, texts: [], sheet: false, plan: false };
 }

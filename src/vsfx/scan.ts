@@ -239,28 +239,26 @@ export function scanTexts(raw: Uint8Array): Shell[] {
  * Gọi onMatrix(offset, Matrix4) cho mỗi bản ghi tìm thấy. */
 export function scanTransforms(raw: Uint8Array, start: number, onMatrix: (off: number, M: THREE.Matrix4) => void): void {
   const L = raw.length, { f64 } = views(raw);
-  const dot = (a: number[], b: number[]) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
   for (let o = Math.max(0, start); o + 96 <= L; o++) {
-    const m: number[] = [];
-    let ok = true;
-    for (let i = 0; i < 9; i++) {
-      const x = f64(o + 24 + i * 8);
-      if (!(Math.abs(x) <= 1.0000001)) { ok = false; break; }
-      m.push(x);
-    }
-    if (!ok) continue;
-    const r = [m.slice(0, 3), m.slice(3, 6), m.slice(6, 9)];
-    for (let i = 0; i < 3 && ok; i++) {
-      if (Math.abs(dot(r[i], r[i]) - 1) > 1e-6) ok = false;
-      for (let j = i + 1; j < 3 && ok; j++) if (Math.abs(dot(r[i], r[j])) > 1e-6) ok = false;
-    }
-    if (!ok) continue;
-    const t = [f64(o), f64(o + 8), f64(o + 16)];
-    if (!t.every(x => Number.isFinite(x) && Math.abs(x) < 1e7)) continue;
+    // lọc nhanh: 9 số xoay phải có |x| ≤ 1 -> byte cao nhất (không dấu) của mỗi f64 ≤ 0x3F; phần lớn dữ liệu ngẫu nhiên (toạ độ ≥ 2, byte cao 0x40+) loại ngay ở đây
+    if ((raw[o + 31] & 0x7f) > 0x3f || (raw[o + 39] & 0x7f) > 0x3f || (raw[o + 47] & 0x7f) > 0x3f) continue;
+    // hàng 1 phải là vector đơn vị (loại vùng toàn số 0 và vùng dữ liệu pháp tuyến/UV) trước khi đọc tiếp — không cấp phát mảng
+    const m0 = f64(o + 24), m1 = f64(o + 32), m2 = f64(o + 40);
+    if (!(Math.abs(m0) <= 1.0000001 && Math.abs(m1) <= 1.0000001 && Math.abs(m2) <= 1.0000001)) continue;
+    if (Math.abs(m0 * m0 + m1 * m1 + m2 * m2 - 1) > 1e-6) continue;
+    const m3 = f64(o + 48), m4 = f64(o + 56), m5 = f64(o + 64);
+    if (!(Math.abs(m3) <= 1.0000001 && Math.abs(m4) <= 1.0000001 && Math.abs(m5) <= 1.0000001)) continue;
+    if (Math.abs(m3 * m3 + m4 * m4 + m5 * m5 - 1) > 1e-6) continue;
+    const m6 = f64(o + 72), m7 = f64(o + 80), m8 = f64(o + 88);
+    if (!(Math.abs(m6) <= 1.0000001 && Math.abs(m7) <= 1.0000001 && Math.abs(m8) <= 1.0000001)) continue;
+    if (Math.abs(m6 * m6 + m7 * m7 + m8 * m8 - 1) > 1e-6) continue;
+    if (Math.abs(m0 * m3 + m1 * m4 + m2 * m5) > 1e-6 || Math.abs(m0 * m6 + m1 * m7 + m2 * m8) > 1e-6 || Math.abs(m3 * m6 + m4 * m7 + m5 * m8) > 1e-6) continue;
+    const t0 = f64(o), t1 = f64(o + 8), t2 = f64(o + 16);
+    if (!(Number.isFinite(t0) && Number.isFinite(t1) && Number.isFinite(t2) && Math.abs(t0) < 1e7 && Math.abs(t1) < 1e7 && Math.abs(t2) < 1e7)) continue;
     const M = new THREE.Matrix4().set(
-      m[0], m[3], m[6], t[0],
-      m[1], m[4], m[7], t[1],
-      m[2], m[5], m[8], t[2],
+      m0, m3, m6, t0,
+      m1, m4, m7, t1,
+      m2, m5, m8, t2,
       0, 0, 0, 1);
     onMatrix(o, M);
     o += 95;
@@ -293,6 +291,7 @@ export function scanExtents(raw: Uint8Array): { h: number; bb: number[] }[] {
     return true;
   };
   for (let o = 0; o + 57 * 4 <= L;) {
+    if (raw[o + 4] | raw[o + 5] | raw[o + 6] | raw[o + 7]) { o++; continue; }   // ok(o) đòi u32(o + 4) = 0: loại nhanh theo byte
     if (ok(o) && ok(o + 57) && ok(o + 114) && ok(o + 171)) {
       while (ok(o)) {
         out.push({ h: u32(o), bb: [0, 1, 2, 3, 4, 5].map(i => f64(o + 9 + i * 8)) });
