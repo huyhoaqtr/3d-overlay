@@ -6,6 +6,7 @@ import * as THREE from 'three';
 import { parseRaw, summarize } from './parse';
 import { parseIfc, type IfcPre } from './parseIfc';
 import { scanShells } from './scan';
+import { isLowMemoryDevice } from './device';
 import { buildMeshData, entityIds, meshDataTransferables, mergeMeshData } from './meshData';
 import type { ScanJob, ScanResult, ScanTask, SliceJob, WorkerRequest, WorkerResponse } from './messages';
 import type { BuildOptions, MeshData, VsfxModel } from './types';
@@ -27,6 +28,9 @@ const post = (msg: WorkerResponse, transfer: Transferable[] = []) => scope.postM
  * chỉ chấp nhận tới COPY_MAX. Không đủ điều kiện (không phải IFC, luồng quá lớn để sao chép) hoặc lỗi -> trả null để phân tích tuần tự như cũ. */
 const COPY_MAX = 320 * 1024 * 1024;
 const PARSE_PARALLEL_MIN = 64 * 1024 * 1024;   // dưới ngưỡng này phân tích tuần tự đã nhanh (khởi động worker phụ không đáng)
+/** Thiết bị ít RAM: ít worker phụ hơn và không sao chép luồng 263 MB (mỗi worker phụ và mỗi bản sao đều tính vào giới hạn ~1–1.5 GB của tab iOS) — xem device.ts. */
+const lowMemory = isLowMemoryDevice();
+
 const scanHelpers: Worker[] = [];
 let scanJobId = 0;
 
@@ -39,7 +43,7 @@ function looksLikeIfc(raw: Uint8Array): boolean {
 
 async function parseParallel(raw: Uint8Array): Promise<VsfxModel | null> {
   const shared = typeof SharedArrayBuffer !== 'undefined' && raw.buffer instanceof SharedArrayBuffer;
-  if (raw.length < PARSE_PARALLEL_MIN || (!shared && raw.length > COPY_MAX) || !looksLikeIfc(raw)) return null;
+  if (raw.length < PARSE_PARALLEL_MIN || (!shared && (lowMemory || raw.length > COPY_MAX)) || !looksLikeIfc(raw)) return null;
   const tasks: ScanTask[] = ['nodesXfs', 'entUnit', 'srcExt'];
   while (scanHelpers.length < tasks.length) scanHelpers.push(new Worker(new URL('./scanWorker.ts', import.meta.url), { type: 'module' }));
   const run = (h: Worker, task: ScanTask) => new Promise<ScanResult>((resolve, reject) => {
@@ -74,8 +78,8 @@ function dropHelpers() { for (const h of helpers) h.terminate(); helpers.length 
 
 async function buildParallel(m: VsfxModel, options: BuildOptions, costs: number[]): Promise<MeshData | null> {
   const cores = (self as unknown as { navigator?: { hardwareConcurrency?: number } }).navigator?.hardwareConcurrency ?? 4;
-  const nHelpers = Math.max(0, Math.min(8, cores - 1));   // chừa 1 lõi cho main thread/UI; worker này chỉ điều phối (không dựng lát) nên luôn phản hồi ngay
-  if (nHelpers < 2) return null;
+  const nHelpers = Math.max(0, Math.min(lowMemory ? 2 : 8, cores - 1));   // chừa 1 lõi cho main thread/UI; worker này chỉ điều phối (không dựng lát) nên luôn phản hồi ngay
+  if (nHelpers < (lowMemory ? 1 : 2)) return null;
   // Nhiều lát nhỏ hơn số worker (×6) và lấy lát kế tiếp khi rảnh: chi phí thật mỗi instance (lọc cạnh) không tỉ lệ đúng với số đỉnh nên chia đều từ đầu bị lệch (lát chậm nhất 5.5 s so với 2 s)
   const nSlices = Math.min(costs.length, nHelpers * 6), total = costs.reduce((a, b) => a + b, 0);
   const bounds = [0];
@@ -97,7 +101,7 @@ async function buildParallel(m: VsfxModel, options: BuildOptions, costs: number[
   const maybeFinish = () => { if (outstanding === 0 && (failed || nextSlice >= nS)) finish(); };
 
   // Mỗi worker phụ giữ sẵn tối đa DEPTH lát trong hàng đợi để không phải chờ vòng giao việc kế tiếp (sao chép dữ liệu lát nằm ở worker này)
-  const DEPTH = 2;
+  const DEPTH = lowMemory ? 1 : 2;
   const jobSlice = new Map<number, number>();
   const dispatch = (h: Worker) => {
     const k = takeSlice();
@@ -126,19 +130,28 @@ async function buildParallel(m: VsfxModel, options: BuildOptions, costs: number[
   return mergeMeshData(results as MeshData[], names, handles);
 }
 
+let keptBuffer: ArrayBuffer | null = null;
+
+async function loadModel(buffer: ArrayBuffer, id: number): Promise<VsfxModel> {
+  const raw = await readStream(buffer);
+  post({ type: 'progress', id, stage: 'parse' });
+  let parsed: VsfxModel | null = null;
+  try { parsed = await parseParallel(raw); } catch (err) { console.warn('Phân tích song song lỗi, phân tích tuần tự:', err); dropScanHelpers(); }
+  return parsed ?? parseRaw(raw);
+}
+
 scope.onmessage = async (e: MessageEvent<WorkerRequest>) => {
   const req = e.data;
   try {
     if (req.type === 'load') {
       model = null;
+      keptBuffer = lowMemory ? req.buffer : null;
       post({ type: 'progress', id: req.id, stage: 'decompress' });
-      const raw = await readStream(req.buffer);
-      post({ type: 'progress', id: req.id, stage: 'parse' });
-      let parsed: VsfxModel | null = null;
-      try { parsed = await parseParallel(raw); } catch (err) { console.warn('Phân tích song song lỗi, phân tích tuần tự:', err); dropScanHelpers(); }
-      model = parsed ?? parseRaw(raw);
+      model = await loadModel(req.buffer, req.id);
       post({ type: 'loaded', id: req.id, summary: summarize(model) });
     } else {
+      // Thiết bị ít RAM bỏ model (shell: ~170 MB với file_14) sau khi dựng lưới và chỉ giữ file nén (27 MB): đổi tuỳ chọn hiển thị sẽ phân tích lại (vài giây) thay vì giữ RAM
+      if (!model && keptBuffer) model = await loadModel(keptBuffer, req.id);
       if (!model) throw new Error('Chưa có model để dựng lưới');
       post({ type: 'progress', id: req.id, stage: 'mesh' });
       let data: MeshData | null = null;
@@ -149,6 +162,7 @@ scope.onmessage = async (e: MessageEvent<WorkerRequest>) => {
         }
       }
       if (!data) data = buildMeshData(model, req.options);
+      if (lowMemory && keptBuffer) model = null;
       post({ type: 'built', id: req.id, data }, meshDataTransferables(data));
     }
   } catch (err) {

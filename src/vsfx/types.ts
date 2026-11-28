@@ -146,6 +146,7 @@ export interface MeshChunk {
   /** độ đục lấy từ vật liệu trong file (chỉ kính; 0 = trong suốt 100%); −1 = không có, dùng GLASS.opacity */
   opacity: number;
   positions: Float32Array;
+  /** pháp tuyến theo đỉnh — CHỈ có cho kính; rỗng với chunk đặc (vật liệu flatShading tính pháp tuyến từ đạo hàm) */
   normals: Float32Array;
   /** màu theo đỉnh (linear) cho faceCol */
   colors: Float32Array | null;

@@ -44,9 +44,10 @@ export interface Batch {
   lines: THREE.LineSegments;
   positions: Float32Array;
   edgePositions: Float32Array;
-  /** chỉ số tam giác / cạnh; ẩn một đoạn = ghi 0 (suy biến), hiện = ghi lại chính chỉ số */
-  vIndex: Uint32Array;
-  eIndex: Uint32Array;
+  /** chỉ số tam giác / cạnh; ẩn một đoạn = ghi 0 (suy biến), hiện = ghi lại chính chỉ số. Tạo LAZY (ensureIndex) — hình học không index vẫn vẽ bình thường, chỉ ẩn/hiện và BVH mới cần
+   *  (file_14: 92 + 48 MB RAM tiết kiệm lúc mở, quan trọng trên điện thoại) */
+  vIndex: Uint32Array | null;
+  eIndex: Uint32Array | null;
   ranges: PartRange[];
   bvh: boolean;
 }
@@ -118,21 +119,17 @@ export class SceneModel {
 
     for (const c of data.chunks) {
       const g = new THREE.BufferGeometry();
-      const vIndex = iota(c.positions.length / 3);
       g.setAttribute('position', new THREE.BufferAttribute(c.positions, 3));
-      g.setAttribute('normal', new THREE.BufferAttribute(c.normals, 3));
+      if (c.normals.length) g.setAttribute('normal', new THREE.BufferAttribute(c.normals, 3));   // chỉ kính có (vật liệu đặc flatShading không đọc normal)
       if (c.colors) g.setAttribute('color', new THREE.BufferAttribute(c.colors, 3));
-      g.setIndex(new THREE.BufferAttribute(vIndex, 1));
       const wire = c.kind === 'wire';
       if (!wire) g.computeBoundingSphere();
       const mesh = new THREE.Mesh(g, wire ? edgeMat : getMat(c.kind, c.color, c.opacity));
       if (c.kind === 'glass') mesh.renderOrder = 1;
       if (wire) mesh.visible = false;      // không có mặt, chỉ có đoạn thẳng
 
-      const eIndex = iota(c.edges.length / 3);
       const eg = new THREE.BufferGeometry();
       eg.setAttribute('position', new THREE.BufferAttribute(c.edges, 3));
-      eg.setIndex(new THREE.BufferAttribute(eIndex, 1));
       eg.computeBoundingSphere();
       const lines = new THREE.LineSegments(eg, wire ? wireMat(c.color) : c.kind === 'glass' ? glassEdge : edgeMat);
       lines.name = 'edges';
@@ -142,7 +139,7 @@ export class SceneModel {
       for (let k = 0; k < c.ranges.length; k += RANGE_STRIDE)
         ranges.push({ entity: c.ranges[k], vStart: c.ranges[k + 1], vCount: c.ranges[k + 2], eStart: c.ranges[k + 3], eCount: c.ranges[k + 4] });
 
-      const batch: Batch = { kind: c.kind, opacity: c.opacity, mesh, lines, positions: c.positions, edgePositions: c.edges, vIndex, eIndex, ranges, bvh: false };
+      const batch: Batch = { kind: c.kind, opacity: c.opacity, mesh, lines, positions: c.positions, edgePositions: c.edges, vIndex: null, eIndex: null, ranges, bvh: false };
       for (const range of ranges) {
         const list = this.parts.get(range.entity);
         if (list) list.push({ batch, range }); else this.parts.set(range.entity, [{ batch, range }]);
@@ -260,9 +257,19 @@ export class SceneModel {
     return this.entityNames.length;
   }
 
+  /** Tạo index buffer (0, 1, 2, …) cho mặt và cạnh của batch khi cần lần đầu (ẩn/hiện, BVH). Dựng không index nhìn y hệt dựng với index đồng nhất. */
+  private ensureIndex(b: Batch) {
+    if (b.vIndex) return;
+    b.vIndex = iota(b.positions.length / 3);
+    b.mesh.geometry.setIndex(new THREE.BufferAttribute(b.vIndex, 1));
+    b.eIndex = iota(b.edgePositions.length / 3);
+    b.lines.geometry.setIndex(new THREE.BufferAttribute(b.eIndex, 1));
+  }
+
   private mask(entity: number, visible: boolean) {
     for (const { batch, range } of this.parts.get(entity) ?? []) {
-      const { vIndex, eIndex } = batch;
+      this.ensureIndex(batch);
+      const vIndex = batch.vIndex!, eIndex = batch.eIndex!;
       for (let i = range.vStart, e = range.vStart + range.vCount; i < e; i++) vIndex[i] = visible ? i : 0;
       for (let i = range.eStart, e = range.eStart + range.eCount; i < e; i++) eIndex[i] = visible ? i : 0;
       batch.mesh.geometry.index!.needsUpdate = true;
@@ -292,6 +299,7 @@ export class SceneModel {
   /** Dựng BVH (indirect: không đảo index buffer, nên bảng range vẫn đúng) cho batch chưa có. */
   private buildBvh(b: Batch) {
     if (b.bvh || b.kind === 'wire') return;
+    this.ensureIndex(b);
     (b.mesh.geometry as THREE.BufferGeometry & { computeBoundsTree(o?: object): void }).computeBoundsTree({ indirect: true });
     b.bvh = true;
   }

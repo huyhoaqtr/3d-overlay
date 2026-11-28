@@ -1,3 +1,4 @@
+import { isLowMemoryDevice } from '../vsfx/device';
 import { forwardRef, useEffect, useImperativeHandle, useRef } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
@@ -313,7 +314,7 @@ const Viewer = forwardRef<ViewerHandle, Props>(function Viewer(
         c.anchored = true;
       }
       c.world.updateMatrixWorld(true);         // mesh con tắt matrixAutoUpdate nên phải cập nhật tường minh
-      model.warmBvh();
+      if (!isLowMemoryDevice()) model.warmBvh();   // điện thoại: BVH dựng lúc chọn lần đầu (dựng sẵn cho file lớn tốn thêm trăm MB RAM)
     }
     for (const l of layers) {
       const st = c.layers.get(l.key);

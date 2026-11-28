@@ -648,10 +648,17 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
           acc.eCount += seg.length / 3;
           continue;
         }
-        const g = new THREE.BufferGeometry();
         const positions = new Float32Array(arr);
-        g.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-        g.computeVertexNormals();
+        // Pháp tuyến chỉ cần cho KÍNH (MeshStandardMaterial không flatShading). Mọi vật liệu đặc đều flatShading: true (pháp tuyến tính từ đạo hàm màn hình) hoặc MeshBasic nên
+        // thuộc tính normal bị bỏ qua -> không dựng/lưu/chuyển giao (file_14: 277 MB và 1.3 s computeVertexNormals; điện thoại hết RAM). Hiển thị không đổi.
+        let normals: Float32Array | null = null;
+        if (kind === 'glass') {
+          const g = new THREE.BufferGeometry();
+          g.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+          g.computeVertexNormals();
+          normals = g.getAttribute('normal').array as Float32Array;
+          g.dispose();
+        }
         let edges: Float32Array;
         const sp = spans[kind];
         if (positions.length / 9 > 30000 && sp.length > 1 && sp[sp.length - 1] === positions.length) {
@@ -679,12 +686,11 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
         const vN = positions.length / 3, eN = edges.length / 3;
         acc.ranges.push(id, acc.vCount, vN, acc.eCount, eN);
         acc.pos.push(positions);
-        acc.nor.push(g.getAttribute('normal').array as Float32Array);
+        if (normals) acc.nor.push(normals);
         if (kind === 'faceCol') acc.col.push(new Float32Array(fcol));
         acc.edg.push(edges);
         acc.vCount += vN;
         acc.eCount += eN;
-        g.dispose();
       }
     });
   });
@@ -736,7 +742,7 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
     color: a.color,
     opacity: a.opacity,
     positions: concat(a.pos, a.vCount * 3),
-    normals: concat(a.nor, a.vCount * 3),
+    normals: a.kind === 'glass' ? concat(a.nor, a.vCount * 3) : new Float32Array(0),
     colors: a.kind === 'faceCol' ? concat(a.col, a.vCount * 3) : null,
     edges: concat(a.edg, a.eCount * 3),
     ranges: new Uint32Array(a.ranges),
@@ -754,6 +760,7 @@ export function meshDataTransferables(data: MeshData): ArrayBuffer[] {
 
 /** Ghép MeshData của các lát liên tiếp (theo thứ tự instance) thành một: cùng khoá (loại, màu, độ đục) thì nối mảng và dời `ranges` (vStart, eStart) — kết quả giống từng số với dựng tuần tự,
  *  vì chunk mới xuất hiện theo thứ tự lát (lát đứng trước chứa các instance đứng trước) và trong chunk các range vẫn theo thứ tự instance. */
+const EMPTY_F32 = new Float32Array(0), EMPTY_U32 = new Uint32Array(0);
 export function mergeMeshData(parts: MeshData[], entities: string[], handles: string[]): MeshData {
   const byKey = new Map<string, MeshChunk[]>();
   for (const d of parts) for (const c of d.chunks) {
@@ -780,6 +787,8 @@ export function mergeMeshData(parts: MeshData[], entities: string[], handles: st
         ranges[oR + r + 4] = c.ranges[r + 4];
       }
       oP += c.positions.length; oN += c.normals.length; oE += c.edges.length; oR += c.ranges.length;
+      // đã chép xong chunk này: bỏ tham chiếu mảng nguồn để GC thu hồi ngay trong lúc ghép (đỉnh bộ nhớ ≈ tổng + một khoá, không phải 2 × tổng — quan trọng trên điện thoại)
+      c.positions = EMPTY_F32; c.normals = EMPTY_F32; c.edges = EMPTY_F32; c.colors = c.colors ? EMPTY_F32 : null; c.ranges = EMPTY_U32;
     }
     chunks.push({ kind: list[0].kind, color: list[0].color, opacity: list[0].opacity, positions, normals, colors, edges, ranges });
   }
