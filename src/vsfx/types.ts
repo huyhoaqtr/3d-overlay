@@ -152,6 +152,11 @@ export interface MeshChunk {
   colors: Float32Array | null;
   /** đoạn thẳng cạnh (EdgesGeometry, ngưỡng 25°) */
   edges: Float32Array;
+  /** Nén (chỉ khi BuildOptions.quantEdges, không áp cho 'wire'): toạ độ lưu Int16 chuẩn hoá [-1,1] quanh tâm/nửa-kích-thước `box` = [cx,cy,cz,hx,hy,hz] của bbox đỉnh chunk
+   *  (cạnh và mặt dùng CHUNG lưới lượng tử nên khớp nhau). `edgesQ` thay `edges` (rỗng); `positionsQ` thay `positions` (rỗng) — trừ kính (pháp tuyến + trong suốt: giữ Float32). Nửa RAM (CPU + GPU) */
+  box?: number[];
+  edgesQ?: Int16Array;
+  positionsQ?: Int16Array;
   /** các đoạn thuộc từng entity, bước 5: [entityId, vStart, vCount, eStart, eCount] (tính theo đỉnh;
    *  vStart/vCount cho tam giác, eStart/eCount cho cạnh). Sắp tăng dần theo vStart. */
   ranges: Uint32Array;
@@ -189,7 +194,7 @@ export interface MeshData {
 }
 
 /** noEdges: không dựng cạnh của mặt (chỉ worker đặt, khi thiết bị ít RAM mở model quá lớn — cạnh chiếm ~90 MB × 2 (CPU + GPU) với file_14) */
-export type BuildOptions = Pick<ViewOptions, 'glass' | 'debugColors'> & { noEdges?: boolean };
+export type BuildOptions = Pick<ViewOptions, 'glass' | 'debugColors'> & { noEdges?: boolean; quantEdges?: boolean };
 
 export type LoadStage = 'decompress' | 'parse' | 'mesh';
 

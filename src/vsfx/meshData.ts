@@ -308,7 +308,7 @@ export function entityIds(instances: VsfxModel['instances']): { idOf: number[]; 
 
 /** `slice`: dựng lưới cho MỘT LÁT liên tiếp của danh sách instance (dựng song song nhiều worker): `base` = chỉ số toàn cục của instance đầu lát, `idOf` = bảng id đối tượng TOÀN CỤC
  *  (tính một lần từ cả danh sách instance). Chỉ dùng cho model thường (không phải bản vẽ). */
-export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn, noEdges }: BuildOptions, slice?: { base: number; idOf: number[] }): MeshData {
+export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn, noEdges, quantEdges }: BuildOptions, slice?: { base: number; idOf: number[] }): MeshData {
   const { instances, unitMM } = model;
   const accs = new Map<string, Acc>();
   const v = new THREE.Vector3(), c3 = new THREE.Color();
@@ -749,21 +749,44 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn, n
     edges: concat(a.edg, a.eCount * 3),
     ranges: new Uint32Array(a.ranges),
   }));
+  if (quantEdges) for (const c of chunks) if (c.kind !== 'wire') quantizeChunk(c);
   return { chunks, entities, handles, texts, sheet: !!model.sheet, plan: !!model.plan };
+}
+
+/** Nén chunk xuống Int16 chuẩn hoá quanh bbox đỉnh của chunk (sai số ≤ kích thước chunk / 65 534: ~mm với chunk trăm mét). Mặt và cạnh dùng chung lưới lượng tử.
+ *  Đỉnh trùng nhau cho kết quả trùng nhau nên không sinh khe nứt. Kính giữ positions Float32 (cần pháp tuyến). */
+function quantizeChunk(c: MeshChunk) {
+  const p = c.positions, n = p.length;
+  if (!n) return;
+  const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < n; i += 3) for (let d = 0; d < 3; d++) { const x = p[i + d]; if (x < mn[d]) mn[d] = x; if (x > mx[d]) mx[d] = x; }
+  const ctr = [0, 0, 0], half = [0, 0, 0];
+  for (let d = 0; d < 3; d++) { ctr[d] = (mn[d] + mx[d]) / 2; half[d] = Math.max((mx[d] - mn[d]) / 2, 1e-6); }
+  const enc = (src: Float32Array) => {
+    const q = new Int16Array(src.length);
+    for (let i = 0; i < src.length; i += 3) for (let d = 0; d < 3; d++) {
+      const v = Math.round(((src[i + d] - ctr[d]) / half[d]) * 32767);
+      q[i + d] = v > 32767 ? 32767 : v < -32767 ? -32767 : v;
+    }
+    return q;
+  };
+  c.box = [...ctr, ...half];
+  if (c.edges.length) { c.edgesQ = enc(c.edges); c.edges = new Float32Array(0); }
+  if (c.kind !== 'glass') { c.positionsQ = enc(p); c.positions = new Float32Array(0); }
 }
 
 /** Danh sách ArrayBuffer cần chuyển giao (transfer) khi gửi MeshData qua postMessage. */
 export function meshDataTransferables(data: MeshData): ArrayBuffer[] {
   const out = new Set<ArrayBuffer>();
   for (const c of data.chunks)
-    for (const a of [c.positions, c.normals, c.colors, c.edges, c.ranges]) if (a) out.add(a.buffer as ArrayBuffer);
+    for (const a of [c.positions, c.normals, c.colors, c.edges, c.edgesQ, c.positionsQ, c.ranges]) if (a) out.add(a.buffer as ArrayBuffer);
   return [...out];
 }
 
 /** Ghép MeshData của các lát liên tiếp (theo thứ tự instance) thành một: cùng khoá (loại, màu, độ đục) thì nối mảng và dời `ranges` (vStart, eStart) — kết quả giống từng số với dựng tuần tự,
  *  vì chunk mới xuất hiện theo thứ tự lát (lát đứng trước chứa các instance đứng trước) và trong chunk các range vẫn theo thứ tự instance. */
 const EMPTY_F32 = new Float32Array(0), EMPTY_U32 = new Uint32Array(0);
-export function mergeMeshData(parts: MeshData[], entities: string[], handles: string[]): MeshData {
+export function mergeMeshData(parts: MeshData[], entities: string[], handles: string[]): MeshData {   // không dùng với cạnh nén (quantEdges chỉ đi cùng concatMeshData)
   const byKey = new Map<string, MeshChunk[]>();
   for (const d of parts) for (const c of d.chunks) {
     const k = `${c.kind}|${c.color}|${c.opacity}`;

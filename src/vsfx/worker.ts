@@ -177,8 +177,8 @@ scope.onmessage = async (e: MessageEvent<WorkerRequest>) => {
       let data: MeshData | null = null;
       const costs = !model.sheet && !model.plan ? modelCosts(model) : null;
       const totalVerts = costs ? costs.reduce((a, b) => a + b, 0) : 0;
-      // thiết bị ít RAM + model rất lớn (file_14 ≈ 4 triệu đỉnh shell): bỏ cạnh của mặt (~90 MB CPU + ~90 MB GPU) để tab iOS không bị giết
-      const options: BuildOptions = lowMemory && totalVerts >= LOWMEM_NO_EDGES_VERTS ? { ...req.options, noEdges: true } : req.options;
+      // thiết bị ít RAM + model rất lớn (file_14 ≈ 4 triệu đỉnh shell): nén cạnh xuống Int16 (~45 MB CPU + 45 MB GPU thay vì 90 + 90) để tab iOS không bị giết
+      const options: BuildOptions = lowMemory && totalVerts >= LOWMEM_NO_EDGES_VERTS ? { ...req.options, quantEdges: true } : req.options;
       if (costs && model.instances.length >= PARALLEL_MIN_INSTANCES && totalVerts >= PARALLEL_MIN_VERTS) {
         try { data = await buildParallel(model, options, costs); } catch (err) { console.warn('Dựng song song lỗi, dựng tuần tự:', err); dropHelpers(); data = null; }
       }

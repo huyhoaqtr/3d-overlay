@@ -44,12 +44,31 @@ export interface Batch {
   lines: THREE.LineSegments;
   positions: Float32Array;
   edgePositions: Float32Array;
+  /** nén Int16 (thiết bị ít RAM, model rất lớn): khi có thì positions / edgePositions rỗng — dùng `posRange` / `edgeRange` để giải nén */
+  posQ: Int16Array | null;
+  edgeQ: Int16Array | null;
+  box: number[] | null;
   /** chỉ số tam giác / cạnh; ẩn một đoạn = ghi 0 (suy biến), hiện = ghi lại chính chỉ số. Tạo LAZY (ensureIndex) — hình học không index vẫn vẽ bình thường, chỉ ẩn/hiện và BVH mới cần
    *  (file_14: 92 + 48 MB RAM tiết kiệm lúc mở, quan trọng trên điện thoại) */
   vIndex: Uint32Array | null;
   eIndex: Uint32Array | null;
   ranges: PartRange[];
   bvh: boolean;
+}
+
+function decode(q: Int16Array, box: number[], start: number, count: number): Float32Array {
+  const out = new Float32Array(count * 3);
+  for (let i = 0, o = start * 3; i < out.length; i += 3, o += 3)
+    for (let d = 0; d < 3; d++) out[i + d] = (q[o + d] / 32767) * box[3 + d] + box[d];
+  return out;
+}
+/** Toạ độ cạnh [eStart, eStart+eCount) của batch (đỉnh liên tiếp, xyz, hệ chunk) — giải nén nếu lưu Int16. */
+export function edgeRange(b: Batch, eStart: number, eCount: number): Float32Array {
+  return b.edgeQ ? decode(b.edgeQ, b.box!, eStart, eCount) : b.edgePositions.subarray(eStart * 3, (eStart + eCount) * 3);
+}
+/** Toạ độ đỉnh mặt [vStart, vStart+vCount) của batch — giải nén nếu lưu Int16. */
+export function posRange(b: Batch, vStart: number, vCount: number): Float32Array {
+  return b.posQ ? decode(b.posQ, b.box!, vStart, vCount) : b.positions.subarray(vStart * 3, (vStart + vCount) * 3);
 }
 
 export interface EntityPart {
@@ -119,7 +138,7 @@ export class SceneModel {
 
     for (const c of data.chunks) {
       const g = new THREE.BufferGeometry();
-      g.setAttribute('position', new THREE.BufferAttribute(c.positions, 3));
+      g.setAttribute('position', c.positionsQ ? new THREE.BufferAttribute(c.positionsQ, 3, true) : new THREE.BufferAttribute(c.positions, 3));
       if (c.normals.length) g.setAttribute('normal', new THREE.BufferAttribute(c.normals, 3));   // chỉ kính có (vật liệu đặc flatShading không đọc normal)
       if (c.colors) g.setAttribute('color', new THREE.BufferAttribute(c.colors, 3));
       const wire = c.kind === 'wire';
@@ -129,17 +148,22 @@ export class SceneModel {
       if (wire) mesh.visible = false;      // không có mặt, chỉ có đoạn thẳng
 
       const eg = new THREE.BufferGeometry();
-      eg.setAttribute('position', new THREE.BufferAttribute(c.edges, 3));
-      if (c.edges.length) eg.computeBoundingSphere();   // noEdges (thiết bị ít RAM, model rất lớn): hình học cạnh rỗng
+      eg.setAttribute('position', c.edgesQ ? new THREE.BufferAttribute(c.edgesQ, 3, true) : new THREE.BufferAttribute(c.edges, 3));
+      if (c.edges.length || c.edgesQ?.length) eg.computeBoundingSphere();   // noEdges (thiết bị ít RAM, model rất lớn): hình học cạnh rỗng
       const lines = new THREE.LineSegments(eg, wire ? wireMat(c.color) : c.kind === 'glass' ? glassEdge : edgeMat);
       lines.name = 'edges';
+      if (c.box) {   // nén Int16 chuẩn hoá: ma trận riêng đưa [-1,1] về toạ độ chunk (BVH/raycast đọc qua getX nên tự giải chuẩn hoá, ray đổi về hệ local bằng ma trận này)
+        const b = c.box;
+        for (const o of c.positionsQ ? [lines, mesh] : [lines]) {   // kính giữ positions Float32 (chỉ cạnh nén) nên mesh không có ma trận
+          o.matrix.makeScale(b[3], b[4], b[5]).setPosition(b[0], b[1], b[2]); o.matrixWorldNeedsUpdate = true; }
+      }
       if (!wire) lines.raycast = () => {};        // chỉ chọn theo mặt, không theo cạnh (đường dữ liệu kiểu 05 thì chọn được)
 
       const ranges: PartRange[] = [];
       for (let k = 0; k < c.ranges.length; k += RANGE_STRIDE)
         ranges.push({ entity: c.ranges[k], vStart: c.ranges[k + 1], vCount: c.ranges[k + 2], eStart: c.ranges[k + 3], eCount: c.ranges[k + 4] });
 
-      const batch: Batch = { kind: c.kind, opacity: c.opacity, mesh, lines, positions: c.positions, edgePositions: c.edges, vIndex: null, eIndex: null, ranges, bvh: false };
+      const batch: Batch = { kind: c.kind, opacity: c.opacity, mesh, lines, positions: c.positions, edgePositions: c.edges, posQ: c.positionsQ ?? null, edgeQ: c.edgesQ ?? null, box: c.box ?? null, vIndex: null, eIndex: null, ranges, bvh: false };
       for (const range of ranges) {
         const list = this.parts.get(range.entity);
         if (list) list.push({ batch, range }); else this.parts.set(range.entity, [{ batch, range }]);
@@ -260,9 +284,9 @@ export class SceneModel {
   /** Tạo index buffer (0, 1, 2, …) cho mặt và cạnh của batch khi cần lần đầu (ẩn/hiện, BVH). Dựng không index nhìn y hệt dựng với index đồng nhất. */
   private ensureIndex(b: Batch) {
     if (b.vIndex) return;
-    b.vIndex = iota(b.positions.length / 3);
+    b.vIndex = iota((b.posQ ?? b.positions).length / 3);
     b.mesh.geometry.setIndex(new THREE.BufferAttribute(b.vIndex, 1));
-    b.eIndex = iota(b.edgePositions.length / 3);
+    b.eIndex = iota((b.edgeQ ?? b.edgePositions).length / 3);
     b.lines.geometry.setIndex(new THREE.BufferAttribute(b.eIndex, 1));
   }
 

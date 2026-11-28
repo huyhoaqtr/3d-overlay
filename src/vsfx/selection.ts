@@ -4,7 +4,7 @@ import * as THREE from 'three';
 import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js';
 import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
 import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
-import type { SceneModel } from './buildScene';
+import { edgeRange, posRange, type SceneModel } from './buildScene';
 import type { Vec3 } from './types';
 
 const COLOR = 0xff9800;
@@ -134,9 +134,9 @@ export class SelectionController {
           for (let d = 0; d < 3; d++) { const x = e[i + d]; if (x < mn[d]) mn[d] = x; if (x > mx[d]) mx[d] = x; }
         continue;
       }
-      const p = batch.positions, end = (range.vStart + range.vCount) * 3;
+      const p = posRange(batch, range.vStart, range.vCount), end = p.length;
       tris += range.vCount / 3;
-      for (let i = range.vStart * 3; i < end; i += 3)
+      for (let i = 0; i < end; i += 3)
         for (let d = 0; d < 3; d++) { const x = p[i + d]; if (x < mn[d]) mn[d] = x; if (x > mx[d]) mx[d] = x; }
     }
     const raw = this.model.entityNames[id] ?? '';
@@ -169,8 +169,8 @@ export class SelectionController {
     const fill = new Float32Array(vN * 3), edge = new Float32Array(eN * 3);
     let vo = 0, eo = 0;
     for (const { batch, range } of parts) {
-      fill.set(batch.positions.subarray(range.vStart * 3, (range.vStart + range.vCount) * 3), vo);
-      edge.set(batch.edgePositions.subarray(range.eStart * 3, (range.eStart + range.eCount) * 3), eo);
+      fill.set(posRange(batch, range.vStart, range.vCount), vo);
+      edge.set(edgeRange(batch, range.eStart, range.eCount), eo);
       vo += range.vCount * 3;
       eo += range.eCount * 3;
     }
