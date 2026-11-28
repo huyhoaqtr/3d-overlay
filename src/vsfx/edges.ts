@@ -8,7 +8,7 @@
  * gần như đồng phẳng (tức đoạn nằm giữa một mặt liền). Đoạn thật sự là biên (mép lỗ cửa) chỉ có một bên nên giữ. */
 
 const COS_COPLANAR = Math.cos(25 * Math.PI / 180);   // cùng ngưỡng với EdgesGeometry
-const GRID = 24;
+const GRID_MIN = 24, GRID_MAX = 160;   // số ô theo đường chéo bbox; lưới thưa quá thì mỗi ô chứa hàng nghìn tam giác (file_13: 41k tam giác/shell -> 1.5 s/shell, cả file không dựng xong)
 const MAX_EDGES = 200_000;
 
 export function pruneCoplanarEdges(pos: Float32Array, edges: Float32Array): Float32Array {
@@ -22,6 +22,7 @@ export function pruneCoplanarEdges(pos: Float32Array, edges: Float32Array): Floa
   const diag = Math.hypot(mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]) || 1;
   const maxAbs = Math.max(...mn.map(Math.abs), ...mx.map(Math.abs));
   const tol = Math.max(diag, maxAbs) * 2e-6;
+  const GRID = Math.min(GRID_MAX, Math.max(GRID_MIN, Math.ceil(Math.sqrt(nT) / 3)));   // mặt cong: tam giác nằm trên mặt (≈ GRID² ô có tam giác) -> ~ 9 tam giác/ô
   const cell = diag / GRID, inv = 1 / cell;
   const dim = [0, 1, 2].map(d => Math.max(1, Math.ceil((mx[d] - mn[d]) / cell) + 1));
   const cellIdx = (x: number, y: number, z: number) => {

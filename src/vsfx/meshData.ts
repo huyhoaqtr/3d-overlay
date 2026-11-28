@@ -246,8 +246,9 @@ export function triangulateShell(sh: Shell): number[] {
 /* Kính: file không lưu transparency, nên nhận diện theo heuristic:
  * màu xanh (B > R + 40) VÀ tấm mỏng (chiều nhỏ nhất ≤ 30 mm, chiều thứ hai ≥ 200 mm). */
 export function isGlass(color: number, sh: Shell, unitMM = 1): boolean {
-  const r = color >> 16 & 255, b = color & 255;
-  if (!(b > r + 40)) return false;
+  const r = color >> 16 & 255, g = color >> 8 & 255, b = color & 255;
+  // xanh rõ (B > R + 40), hoặc kính nhạt ngả cyan (G, B đều > R: fbffff của mặt bàn kính #110 trong file_13, dae3e0 — gần trắng nên B − R chỉ 4–6)
+  if (!(b > r + 40 || (r >= 0xd0 && b > r && g > r))) return false;   // kính nhạt: chỉ khi RẤT sáng (R ≥ d0), để các tấm xám-xanh thường (96aaaf…) không bị coi là kính
   const v = sh.verts, mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
   for (let k = 0; k < v.length; k += 3) for (let d = 0; d < 3; d++) { mn[d] = Math.min(mn[d], v[k + d]); mx[d] = Math.max(mx[d], v[k + d]); }
   const ext = mx.map((x, d) => (x - mn[d]) * unitMM).sort((a, c) => a - c);
@@ -431,6 +432,7 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
       const lineInk = view ? 0x0a0a0a : 0;
       const color = debugColors ? new THREE.Color().setHSL((ii * 0.618) % 1, .55, .6).getHex() : view && part.opacity !== undefined && part.opacity < 1 ? 0xd2e9f6 : (part.color || 0xb0b0b0);   // kính trong viewport: xanh nhạt như ảnh gốc (file lưu trắng)
       const buckets: Record<ChunkKind, number[]> = { opaque: [], glass: [], faceCol: [], wire: [] };
+      const spans: Record<ChunkKind, number[]> = { opaque: [], glass: [], faceCol: [], wire: [] };   // vị trí (số float) cuối mỗi shell trong bucket, để lọc cạnh theo từng shell
       const fcol: number[] = [];
       const alpha = part.opacity ?? -1;     // ≥ 0: vật liệu trong file có độ đục < 1 (kính, khối trong suốt)
       for (const sh of part.shells) {
@@ -609,15 +611,19 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
           }
           continue;
         }
+        // IfcSite (mặt đất) thường CÙNG độ cao với mặt trên sàn nhà (file_13: ground z = 0, IfcSlab sàn z −300…0) -> hai mặt đồng phẳng, depth test z-fight: khi xoay/zoom sàn lẫn màu xanh của đất.
+        // Hạ mặt đất xuống 20 mm (đổi ra đơn vị file) — dưới ngưỡng nhìn thấy nhưng đủ để vượt sai số độ sâu.
+        const dz = ins.name.endsWith('::IfcSite') ? 20 / unitMM : 0;
         tri.forEach((vi, k) => {
           v.set(sh.verts[vi * 3], sh.verts[vi * 3 + 1], sh.verts[vi * 3 + 2]).applyMatrix4(M);
-          out.push(v.x, v.y, v.z);
+          out.push(v.x, v.y, v.z - dz);
           if (faceColors) {
             const fc = faceColors[triFace[(k / 3) | 0]];
             c3.setHex(fc ?? color, THREE.SRGBColorSpace);
             fcol.push(c3.r, c3.g, c3.b);
           }
         });
+        spans[faceColors ? 'faceCol' : glass ? 'glass' : 'opaque'].push(out.length);
       }
       for (const kind of ['opaque', 'glass', 'faceCol', 'wire'] as const) {
         const arr = buckets[kind];
@@ -635,8 +641,31 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
         const positions = new Float32Array(arr);
         g.setAttribute('position', new THREE.BufferAttribute(positions, 3));
         g.computeVertexNormals();
-        const edgesGeo = new THREE.EdgesGeometry(g, 25);
-        const edges = pruneCoplanarEdges(positions, edgesGeo.getAttribute('position').array as Float32Array);
+        let edges: Float32Array;
+        const sp = spans[kind];
+        if (positions.length / 9 > 30000 && sp.length > 1 && sp[sp.length - 1] === positions.length) {
+          // Bucket khổng lồ (file_13: 1 part 335 shell, 330 000 tam giác): lọc cạnh trên cả bucket là phi tuyến (lưới không gian + T-junction) -> treo hàng chục giây.
+          // Các shell độc lập không chia cạnh với nhau nên lọc từng shell riêng (shell lớn nhất 40 000 tam giác ≈ 0.5 s).
+          const pieces: Float32Array[] = [];
+          let a = 0, tot = 0;
+          for (const b of sp) {
+            if (b > a) {
+              const sub = positions.subarray(a, b), gs = new THREE.BufferGeometry();
+              gs.setAttribute('position', new THREE.BufferAttribute(sub, 3));
+              const eg = new THREE.EdgesGeometry(gs, 25), ea = eg.getAttribute('position').array as Float32Array, pe = sub.length / 9 > 20000 ? ea : pruneCoplanarEdges(sub, ea);   // shell > 20 000 tam giác (mặt cong hữu cơ): bỏ lọc T-junction cho nhanh
+              pieces.push(pe); tot += pe.length;
+              gs.dispose(); eg.dispose();
+            }
+            a = b;
+          }
+          edges = new Float32Array(tot);
+          let o2 = 0;
+          for (const pe of pieces) { edges.set(pe, o2); o2 += pe.length; }
+        } else {
+          const edgesGeo0 = new THREE.EdgesGeometry(g, 25);
+          edges = pruneCoplanarEdges(positions, edgesGeo0.getAttribute('position').array as Float32Array);
+          edgesGeo0.dispose();
+        }
         const op = kind === 'glass' ? alpha : -1;
         const key = kind === 'faceCol' ? kind : `${kind}:${color}:${op}`;
         let acc = accs.get(key);
@@ -650,7 +679,6 @@ export function buildMeshData(model: VsfxModel, { debugColors, glass: glassOn }:
         acc.vCount += vN;
         acc.eCount += eN;
         g.dispose();
-        edgesGeo.dispose();
       }
     });
   });

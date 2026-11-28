@@ -26,6 +26,8 @@ interface Entity {
   p: number;
   name: string;
   color: number;
+  /** header con mang cờ trong suốt `0C 01 00 00 41 00 00 [BGR] C2` (file_13: kính cửa sổ/cửa đi; vật liệu đục là `…01 00 00`) */
+  glass?: boolean;
   insert?: InsertParams;
 }
 
@@ -35,12 +37,14 @@ interface TopEntity extends Entity {
   end: number;
 }
 
-const NODE_MARK = [0x40, 0x10, 0x11, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x72];
+// Byte cuối: 0x72 ở các file mẫu, 0x70 ở file_13.vsfx (IFC2x3 xuất từ bản ODA khác — trước đây không nhận ra node nào nên bị đọc như OdTv: mất màu, mất cấu trúc entity)
+const NODE_MARK = [0x40, 0x10, 0x11, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00];
 
 export function scanIfcNodes(raw: Uint8Array): IfcNode[] {
   const L = raw.length, { u32 } = views(raw), nodes: IfcNode[] = [];
   outer: for (let o = 0; o + 60 <= L; o++) {
     for (let k = 0; k < NODE_MARK.length; k++) if (raw[o + k] !== NODE_MARK[k]) continue outer;
+    if (raw[o + 10] !== 0x72 && raw[o + 10] !== 0x70) continue;
     nodes.push({ off: o, owner: u32(o + 44), handle: u32(o + 22) });
   }
   return nodes;
@@ -73,11 +77,13 @@ function scanEntities(raw: Uint8Array): Entity[] {
       name += String.fromCharCode(lo);
     }
     if (!ok) continue;
-    const color = raw[p] === 0xc2 ? (raw[p - 1] << 16) | (raw[p - 2] << 8) | raw[p - 3] : 0;
-    const ent: Entity = { p, name, color };
+    // C2 = màu thật; 000000 là ĐEN thật (mái IfcSlab của file_13 — ảnh gốc đen), không phải "chưa đặt" -> 0x000001 để khỏi bị `|| màu mặc định` nuốt
+    const color = raw[p] === 0xc2 ? ((raw[p - 1] << 16) | (raw[p - 2] << 8) | raw[p - 3]) || 0x000001 : 0;
+    const glass = raw[p] === 0xc2 && raw[p - 10] === 0x0c && raw[p - 9] === 1 && !raw[p - 8] && !raw[p - 7] && raw[p - 6] === 0x41 && !raw[p - 5] && !raw[p - 4];
+    const ent: Entity = { p, name, color, glass };
     const q = p - 115;
-    if (q >= 0 && raw[q] === 0x18 && raw[q + 1] === 0 && raw[q + 2] === 0x1d && raw[q + 8] === 1 &&
-        raw[q + 110] === 0x0d && (raw[q + 111] === 0x06 || raw[q + 111] === 0x04)) {
+    if (q >= 0 && (raw[q] === 0x18 || raw[q] === 0x00) && raw[q + 1] === 0 && raw[q + 2] === 0x1d && raw[q + 8] === 1 &&
+        ((raw[q + 110] === 0x0d && (raw[q + 111] === 0x06 || raw[q + 111] === 0x04)) || (raw[q + 110] === 0x0c && raw[q + 111] === 0x01))) {   // 0C 01 = biến thể của file_13 (85 INSERT; trước đó chỉ nhận 0D 04|06 nên ghế/bàn lặp lại biến mất)
       const d = (i: number) => f64(q + 21 + i * 8);
       ent.insert = { P: [d(0), d(1), d(2)], S: [d(3), d(4), d(5)], ang: d(6), N: [d(7), d(8), d(9)], h: u32(q + 101) };
     }
@@ -108,6 +114,9 @@ export function parseIfc(raw: Uint8Array, shells: Shell[], nodes: IfcNode[]): Vs
     if (ni + 1 < nodes.length) bound = Math.min(bound, nodes[ni + 1].off);
     while (si < shells.length && shells[si].off < e.p) si++;
     const part: Part = { color: e.color, shells: [] };
+    // Cờ 41 một mình KHÔNG đủ: ghế #46 (616676 xám-xanh, vải) cũng mang cờ 41 nhưng đặc. Chỉ nhận là kính khi màu cũng là màu kính (xanh rõ hoặc rất nhạt ngả cyan).
+    const cr = e.color >> 16 & 255, cg = e.color >> 8 & 255, cb = e.color & 255;
+    if (e.glass && (cb > cr + 40 || (cr >= 0xd0 && cb > cr && cg > cr))) part.opacity = 0.35;   // độ đục thật không đọc được (chưa tìm AcCmTransparency gắn với header) -> mức kính Revit (0.35), người dùng chỉnh qua GLASS.opacity
     for (let k = si; k < shells.length && shells[k].off < bound; k++) part.shells.push(shells[k]);
     const parent = top[top.length - 1];
     if (!e.insert && isSub(e.name) && parent && parent.ni === ni) {
